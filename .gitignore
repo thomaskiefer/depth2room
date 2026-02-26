@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training outputs
+output/
+eval_output/
+infer_output/
+
+# Logs
+*.log
+
+# Data (too large for git, top-level only)
+/data/
+
+# Weights & checkpoints
+*.safetensors
+*.pth
+*.pt
+!scripts/*.sh

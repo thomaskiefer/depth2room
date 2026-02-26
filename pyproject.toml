@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.backends._legacy:_Backend"
+
+[project]
+name = "depth2room"
+version = "0.1.0"
+description = "Depth-conditioned video generation for room furnishing using VACE"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "einops",
+    "accelerate",
+    "numpy",
+    "Pillow",
+]
+
+[project.optional-dependencies]
+training = [
+    "diffsynth-studio @ git+https://github.com/modelscope/DiffSynth-Studio.git",
+    "wandb",
+    "peft",
+]
+data = [
+    "moderngl",
+    "glcontext",
+    "aiofiles",
+    "aiohttp",
+    "nest-asyncio",
+]
+inference = [
+    "diffsynth-studio @ git+https://github.com/modelscope/DiffSynth-Studio.git",
+    "imageio[ffmpeg]",
+    "matplotlib",
+    "scipy",
+    "opencv-python",
+]
+eval = [
+    "lpips",
+    "scikit-image",
+]
+all = ["depth2room[training,data,inference,eval]"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
