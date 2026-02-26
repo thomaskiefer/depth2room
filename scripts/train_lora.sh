@@ -10,8 +10,8 @@ set -euo pipefail
 
 # ---- Paths (override via environment variables) ----
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-VACE_MODEL_DIR="${VACE_MODEL_DIR:-/iopsstor/scratch/cscs/thomaskiefer/VACE/models/Wan2.1-VACE-1.3B}"
-DATA_DIR="${DATA_DIR:-/iopsstor/scratch/cscs/thomaskiefer/cad_estate/data/vace_training_dataset}"
+VACE_MODEL_DIR="${VACE_MODEL_DIR:?Set VACE_MODEL_DIR to your Wan2.1-VACE model directory}"
+DATA_DIR="${DATA_DIR:?Set DATA_DIR to your prepared training dataset directory}"
 METADATA_CSV="${DATA_DIR}/metadata.csv"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/lora_depth_vace}"
 
