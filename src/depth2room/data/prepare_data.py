@@ -245,9 +245,13 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             "video_id": video_id,
             "num_frames": num_frames,
             "stride": depth_meta.get("stride", stride),
+            "source_start_idx": depth_meta.get("source_start_idx"),
+            "source_resolution": depth_meta.get("source_resolution"),
+            "target_resolution": [TARGET_H, TARGET_W],
             "depth_path": os.path.join(video_id, f"{clip_name}_depth.pt"),
             "rgb_path": os.path.join(video_id, f"{clip_name}_rgb.mp4"),
             "ref_path": os.path.join(video_id, f"{clip_name}_ref.jpg"),
+            "ref_frame_idx": depth_meta.get("ref_frame_idx"),
             "skipped": True,
         }
 
@@ -361,6 +365,8 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             "z_far": z_far,
             "stride": stride,
             "source_start_idx": int(start_idx),
+            "source_resolution": [src_h, src_w],
+            "ref_frame_idx": ref_frame_idx,
             "source_fps": 30,
             "effective_fps": 30 / stride,
         }
@@ -371,17 +377,12 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         video_path = os.path.join(scene_output_dir, f"{clip_name}_rgb.mp4")
         save_rgb_video(rgb_tensor, video_path, fps=int(30 / stride))
 
+        # Save reference image from a random frame (or skip entirely)
+        ref_frame_idx = random.randint(0, num_frames - 1)
         ref_path = os.path.join(scene_output_dir, f"{clip_name}_ref.jpg")
-        ref_img = rgb_tensor[0]
+        ref_img = rgb_tensor[ref_frame_idx]
         ref_pil = torchvision.transforms.functional.to_pil_image(ref_img)
         ref_pil.save(ref_path, quality=95)
-
-        # Build metadata entry
-        has_reference = random.random() < 0.85
-        if has_reference:
-            ref_frame_idx = random.randint(0, num_frames - 1)
-        else:
-            ref_frame_idx = None
 
         metadata = {
             "clip_name": clip_name,
@@ -393,7 +394,7 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             "target_resolution": [TARGET_H, TARGET_W],
             "depth_path": os.path.join(video_id, os.path.basename(depth_path)),
             "rgb_path": os.path.join(video_id, os.path.basename(video_path)),
-            "ref_path": os.path.join(video_id, os.path.basename(ref_path)) if has_reference else None,
+            "ref_path": os.path.join(video_id, os.path.basename(ref_path)),
             "ref_frame_idx": ref_frame_idx,
         }
 
@@ -428,7 +429,7 @@ def main():
     )
     parser.add_argument(
         "--cad_estate_root", type=str,
-        default=os.environ.get("CAD_ESTATE_ROOT", "/iopsstor/scratch/cscs/thomaskiefer/cad_estate"),
+        default=os.environ.get("CAD_ESTATE_ROOT"),
         help="Root of the cad-estate repository clone"
     )
     parser.add_argument(
@@ -444,10 +445,6 @@ def main():
     parser.add_argument("--max_scenes", type=int, default=None)
     parser.add_argument("--num_frames", type=int, default=81)
     parser.add_argument("--stride", type=int, default=2)
-    parser.add_argument(
-        "--normalization", type=str, default="local", choices=["local"],
-        help="Depth normalization method (per-frame local min-max)"
-    )
     parser.add_argument("--z_far", type=float, default=200.0)
     parser.add_argument("--min_source_frames", type=int, default=None)
     args = parser.parse_args()
@@ -485,7 +482,7 @@ def main():
             else:
                 failed += 1
     else:
-        num_gpus = 4
+        num_gpus = max(1, torch.cuda.device_count())
         work_items = [(clip_name, args, i % num_gpus) for i, clip_name in enumerate(scenes)]
         with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
             futures = {executor.submit(_worker, item): item[0] for item in work_items}

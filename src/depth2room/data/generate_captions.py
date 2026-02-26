@@ -117,11 +117,12 @@ def build_fallback_caption(scene_id: str, annotations_dir: str) -> str:
             else:
                 parts.append(f"{count} {elem_type}s")
 
-    elements_str = ", ".join(parts[:-1])
-    if len(parts) > 1:
-        elements_str += f", and {parts[-1]}"
-    else:
+    if len(parts) == 1:
         elements_str = parts[0]
+    elif len(parts) == 2:
+        elements_str = f"{parts[0]} and {parts[1]}"
+    else:
+        elements_str = ", ".join(parts[:-1]) + f", and {parts[-1]}"
 
     caption = (
         f"A real-estate interior walkthrough video of a room with {elements_str}. "
@@ -303,7 +304,6 @@ def generate_vl_captions(
     annotations_dir: str,
     vl_model_path: str | None,
     lm_model_path: str | None,
-    batch_size: int,
     output_path: str,
     existing_captions: dict[str, str] | None = None,
 ) -> dict[str, str]:
@@ -421,12 +421,6 @@ def main():
         help="Skip VL captioning; generate template captions from room structure labels only.",
     )
     parser.add_argument(
-        "--batch_size",
-        type=int,
-        default=1,
-        help="Batch size for VL inference (default: 1).",
-    )
-    parser.add_argument(
         "--vl_model_path",
         type=str,
         default=None,
@@ -470,12 +464,15 @@ def main():
                     ref_images[scene_dir.name] = ""  # No image, will use fallback
             print(f"Found {len(ref_images)} scenes from annotations directory")
 
-    # Shard: select subset of scenes for this shard
+    # Shard: select subset of scenes for this shard, use per-shard output file
     if args.shard_id is not None and args.num_shards is not None:
         all_keys = sorted(ref_images.keys())
         shard_keys = [k for i, k in enumerate(all_keys) if i % args.num_shards == args.shard_id]
         ref_images = {k: ref_images[k] for k in shard_keys}
-        print(f"Shard {args.shard_id}/{args.num_shards}: processing {len(ref_images)} scenes")
+        # Per-shard output file to avoid race conditions between concurrent shards
+        base, ext = os.path.splitext(output_path)
+        output_path = f"{base}_shard{args.shard_id}{ext}"
+        print(f"Shard {args.shard_id}/{args.num_shards}: processing {len(ref_images)} scenes -> {output_path}")
 
     # Resume: load existing captions if output file already exists
     existing_captions = {}
@@ -500,7 +497,6 @@ def main():
                 args.annotations_dir,
                 args.vl_model_path,
                 args.lm_model_path,
-                args.batch_size,
                 output_path,
                 existing_captions,
             )

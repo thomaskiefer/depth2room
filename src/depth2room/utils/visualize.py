@@ -55,21 +55,28 @@ def main():
     print(f"Frames: {n_frames}")
 
     raw_valid = raw_depth[raw_depth > 0]
-    global_max = min(float(np.percentile(raw_valid.numpy(), 98)), meta["z_far"])
+    if raw_valid.numel() == 0:
+        print("Warning: all raw depth values are zero, using z_far as global_max")
+        global_max = meta["z_far"]
+    else:
+        global_max = min(float(np.percentile(raw_valid.numpy(), 98)), meta["z_far"])
+
+    # Derive dimensions from actual tensor shape
+    frame_h, frame_w = depth.shape[2], depth.shape[3]
 
     # Side-by-side video
     out_path = f"{out_dir}/{clip}_sidebyside.mp4"
     container = av.open(out_path, mode="w")
     stream = container.add_stream("libx264", rate=16)
-    stream.width = 832 * 3
-    stream.height = 480
+    stream.width = frame_w * 3
+    stream.height = frame_h
     stream.pix_fmt = "yuv420p"
     stream.options = {"crf": "18"}
 
     for i in range(n_frames):
         rgb = rgb_frames[i]
-        if rgb.shape[0] != 480 or rgb.shape[1] != 832:
-            rgb = np.array(Image.fromarray(rgb).resize((832, 480), Image.BILINEAR))
+        if rgb.shape[0] != frame_h or rgb.shape[1] != frame_w:
+            rgb = np.array(Image.fromarray(rgb).resize((frame_w, frame_h), Image.BILINEAR))
 
         disp = depth[0, i].numpy()
         disp_01 = (disp + 1.0) / 2.0
@@ -95,8 +102,8 @@ def main():
     out_path2 = f"{out_dir}/{clip}_depth_turbo.mp4"
     container = av.open(out_path2, mode="w")
     stream = container.add_stream("libx264", rate=16)
-    stream.width = 832
-    stream.height = 480
+    stream.width = frame_w
+    stream.height = frame_h
     stream.pix_fmt = "yuv420p"
     stream.options = {"crf": "18"}
 

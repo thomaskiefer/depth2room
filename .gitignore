@@ -37,4 +37,6 @@ infer_output/
 *.safetensors
 *.pth
 *.pt
-!scripts/*.sh
+
+# Experiment tracking
+wandb/

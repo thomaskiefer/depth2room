@@ -20,6 +20,9 @@ pip install -e ".[data]"
 # For inference:
 pip install -e ".[inference]"
 
+# For evaluation metrics (LPIPS, SSIM):
+pip install -e ".[eval]"
+
 # Everything:
 pip install -e ".[all]"
 ```

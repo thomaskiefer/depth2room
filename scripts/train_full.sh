@@ -14,6 +14,7 @@ VACE_MODEL_DIR="${VACE_MODEL_DIR:?Set VACE_MODEL_DIR to your Wan2.1-VACE model d
 DATA_DIR="${DATA_DIR:?Set DATA_DIR to your prepared training dataset directory}"
 METADATA_CSV="${DATA_DIR}/metadata.csv"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/output/full_depth_vace}"
+NUM_PROCESSES="${NUM_PROCESSES:-4}"
 
 # ---- NCCL timeout mitigation for distributed checkpoint saves ----
 export NCCL_TIMEOUT=1800
@@ -21,7 +22,7 @@ export NCCL_TIMEOUT=1800
 # ---- Launch training ----
 accelerate launch \
     --multi_gpu \
-    --num_processes 4 \
+    --num_processes "${NUM_PROCESSES}" \
     --mixed_precision bf16 \
     -m depth2room.training.train \
     --task "sft" \
@@ -29,7 +30,6 @@ accelerate launch \
     --tokenizer_path "${VACE_MODEL_DIR}/google/umt5-xxl" \
     --dataset_base_path "${DATA_DIR}" \
     --dataset_metadata_path "${METADATA_CSV}" \
-    --data_file_keys "video,vace_reference_image" \
     --extra_inputs "vace_video_tensor,vace_reference_image" \
     --output_path "${OUTPUT_DIR}" \
     --remove_prefix_in_ckpt "pipe.vace." \

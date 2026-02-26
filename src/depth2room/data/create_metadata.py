@@ -83,6 +83,8 @@ def main():
             missing_files += 1
             continue
 
+        # ref_path is always set in metadata.json; the no-ref dropout
+        # happens here only (not doubled with prepare_data.py).
         include_ref = ref_path and (random.random() >= args.no_ref_fraction)
         ref_rel = ref_path if include_ref else ""
 

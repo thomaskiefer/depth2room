@@ -13,7 +13,9 @@ The returned dict contains:
   - "vace_reference_image": list[PIL.Image] or None
 """
 
+import math
 import os
+
 import torch
 from diffsynth.core.data.unified_dataset import UnifiedDataset
 from diffsynth.core.data.operators import (
@@ -130,7 +132,6 @@ class VACEDepthDataset(torch.utils.data.Dataset):
         # Store metadata for direct depth loading
         # Fix NaN/empty values from pandas CSV reader (empty cells become float NaN).
         # Remove keys with empty/NaN values so operators are not called on them.
-        import math
         for row in self.unified_dataset.data:
             keys_to_remove = []
             for key, val in row.items():
@@ -155,6 +156,17 @@ class VACEDepthDataset(torch.utils.data.Dataset):
 
         if vace_video_path:
             depth_tensor = self.depth_loader(vace_video_path)
+            # Validate depth tensor dimensions match video frames
+            num_video_frames = len(data["video"])
+            assert depth_tensor.shape[1] == num_video_frames, (
+                f"Depth tensor has {depth_tensor.shape[1]} frames but video has "
+                f"{num_video_frames} frames for {vace_video_path}"
+            )
+            frame_h, frame_w = data["video"][0].size[1], data["video"][0].size[0]
+            assert depth_tensor.shape[2] == frame_h and depth_tensor.shape[3] == frame_w, (
+                f"Depth tensor spatial size {depth_tensor.shape[2]}x{depth_tensor.shape[3]} "
+                f"doesn't match video frame size {frame_h}x{frame_w} for {vace_video_path}"
+            )
             data["vace_video_tensor"] = depth_tensor
         else:
             data["vace_video_tensor"] = None

@@ -11,7 +11,6 @@ import torch
 from einops import rearrange
 
 from diffsynth.pipelines.wan_video import WanVideoPipeline, WanVideoUnit_VACE
-from diffsynth.diffusion.base_pipeline import PipelineUnit
 
 
 class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):

@@ -60,7 +60,8 @@ def load_depth_input(path, device="cpu"):
                 tensor = tensor.permute(1, 0, 2, 3)
             elif tensor.shape[3] == 3:
                 tensor = tensor.permute(3, 0, 1, 2)
-        if tensor.max() > 1.0:
+        if tensor.max() > 2.0:
+            # Likely in [0, 255] range (uint8-like), normalize to [-1, 1]
             tensor = tensor.float() / 127.5 - 1.0
         return tensor.float()
     else:

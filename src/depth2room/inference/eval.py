@@ -18,6 +18,7 @@ import argparse
 import json
 import os
 import random
+import shutil
 
 import torch
 from PIL import Image
@@ -91,6 +92,12 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
         print(f"  Prompt: {scene['prompt'][:100]}...")
 
         depth_tensor = torch.load(scene["depth_path"], map_location="cpu", weights_only=True)
+        assert depth_tensor.ndim == 4 and depth_tensor.shape[0] == 3, (
+            f"Expected depth tensor [3, T, H, W], got {depth_tensor.shape}"
+        )
+        assert depth_tensor.min() >= -1.0 - 1e-3 and depth_tensor.max() <= 1.0 + 1e-3, (
+            f"Depth tensor values out of [-1, 1] range: [{depth_tensor.min():.4f}, {depth_tensor.max():.4f}]"
+        )
         print(f"  Depth: {depth_tensor.shape}, range [{depth_tensor.min():.2f}, {depth_tensor.max():.2f}]")
 
         ref_image = None
@@ -123,7 +130,7 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
 
         gt_path = os.path.join(scene_dir, "ground_truth.mp4")
         if os.path.exists(scene["rgb_path"]):
-            os.system(f'cp "{scene["rgb_path"]}" "{gt_path}"')
+            shutil.copy2(scene["rgb_path"], gt_path)
 
         if ref_image is not None:
             ref_image.save(os.path.join(scene_dir, "reference.jpg"))

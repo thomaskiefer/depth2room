@@ -208,7 +208,7 @@ def get_reference_image(exr_path: str, height: int = 480,
         img = Image.fromarray(rgb_uint8)
         img = img.resize((width, height), Image.LANCZOS)
         return img
-    except (ValueError, Exception) as e:
+    except Exception as e:
         print(f"  Could not extract reference image: {e}")
         return None
 
@@ -322,7 +322,8 @@ def main():
     save_video(video, gen_path, fps=16, quality=5)
     print(f"Saved: {gen_path}")
 
-    turbo = cm.get_cmap("turbo")
+    import matplotlib
+    turbo = matplotlib.colormaps["turbo"]
     depth_frames = []
     for t in range(depth_tensor.shape[1]):
         disp_01 = ((depth_tensor[0, t].numpy() + 1.0) / 2.0).clip(0, 1)

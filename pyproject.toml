@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68.0"]
-build-backend = "setuptools.backends._legacy:_Backend"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "depth2room"
@@ -28,6 +28,8 @@ data = [
     "aiofiles",
     "aiohttp",
     "nest-asyncio",
+    "transformers",
+    "qwen-vl-utils",
 ]
 inference = [
     "diffsynth-studio @ git+https://github.com/modelscope/DiffSynth-Studio.git",
@@ -35,6 +37,9 @@ inference = [
     "matplotlib",
     "scipy",
     "opencv-python",
+    "OpenEXR",
+    "safetensors",
+    "av",
 ]
 eval = [
     "lpips",

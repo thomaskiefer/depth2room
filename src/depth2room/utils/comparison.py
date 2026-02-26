@@ -13,9 +13,9 @@ import json
 import os
 
 import imageio
+import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
-from diffsynth.utils.data import save_video
 
 
 def load_metadata(data_dir):
@@ -79,7 +79,10 @@ def make_side_by_side(eval_dir, scene_name, data_dir, metadata):
     depth_frames = depth_tensor_to_frames(depth_tensor)
 
     depth_video_path = os.path.join(scene_dir, "depth.mp4")
-    save_video(depth_frames, depth_video_path, fps=16, quality=5)
+    writer = imageio.get_writer(depth_video_path, fps=16, codec="libx264", quality=8)
+    for frame in depth_frames:
+        writer.append_data(np.array(frame))
+    writer.close()
 
     generated_path = os.path.join(scene_dir, "generated.mp4")
     reader = imageio.get_reader(generated_path)
@@ -128,7 +131,10 @@ def make_side_by_side(eval_dir, scene_name, data_dir, metadata):
         comparison_frames.append(composite)
 
     comparison_path = os.path.join(scene_dir, "comparison.mp4")
-    save_video(comparison_frames, comparison_path, fps=16, quality=5)
+    writer = imageio.get_writer(comparison_path, fps=16, codec="libx264", quality=8)
+    for frame in comparison_frames:
+        writer.append_data(np.array(frame))
+    writer.close()
     print(f"  Saved: {comparison_path}")
     return comparison_path
 
