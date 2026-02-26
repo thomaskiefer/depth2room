@@ -44,25 +44,36 @@ def setup_logging():
     )
 
 
-def load_depth_input(path, device="cpu"):
-    """Load depth input from .pt tensor or .mp4 video.
+def load_video_tensor(path, device="cpu"):
+    """Load a video tensor from .pt file or .mp4 video.
 
-    Returns a tensor of shape [C, T, H, W] in [-1, 1].
+    Works for both depth and RGB tensors. Returns [C, T, H, W] in [-1, 1].
     """
-    assert os.path.exists(path), f"Depth video not found: {path}"
+    assert os.path.exists(path), f"Video file not found: {path}"
 
     if path.endswith(".pt"):
         tensor = torch.load(path, map_location=device, weights_only=True)
-        if tensor.ndim == 4:
-            if tensor.shape[0] == 3:
-                pass
-            elif tensor.shape[1] == 3:
-                tensor = tensor.permute(1, 0, 2, 3)
-            elif tensor.shape[3] == 3:
-                tensor = tensor.permute(3, 0, 1, 2)
+        assert tensor.ndim == 4, f"Expected 4D tensor, got shape {tensor.shape}"
+        # Detect layout: expected [3, T, H, W]. Also handle [T, 3, H, W] and [T, H, W, 3].
+        if tensor.shape[0] == 3:
+            pass  # already [C, T, H, W]
+        elif tensor.shape[1] == 3:
+            logging.info("Detected [T, C, H, W] layout, transposing to [C, T, H, W]")
+            tensor = tensor.permute(1, 0, 2, 3)
+        elif tensor.shape[3] == 3:
+            logging.info("Detected [T, H, W, C] layout, transposing to [C, T, H, W]")
+            tensor = tensor.permute(3, 0, 1, 2)
+        else:
+            logging.warning(
+                "Could not auto-detect tensor layout (shape=%s), assuming [C, T, H, W]",
+                tensor.shape,
+            )
         if tensor.max() > 2.0:
-            # Likely in [0, 255] range (uint8-like), normalize to [-1, 1]
+            logging.info("Auto-rescaling from [0,255] to [-1,1]")
             tensor = tensor.float() / 127.5 - 1.0
+        elif tensor.min() >= 0.0 and tensor.max() <= 1.0:
+            logging.info("Auto-rescaling from [0,1] to [-1,1]")
+            tensor = tensor.float() * 2.0 - 1.0
         return tensor.float()
     else:
         cap = cv2.VideoCapture(path)
@@ -74,6 +85,7 @@ def load_depth_input(path, device="cpu"):
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             frames.append(frame)
         cap.release()
+        assert len(frames) > 0, f"No frames read from video: {path}"
         arr = np.stack(frames, axis=0)
         tensor = torch.from_numpy(arr).float().permute(3, 0, 1, 2)
         tensor = tensor / 127.5 - 1.0
@@ -133,13 +145,22 @@ def load_finetuned_weights(model, finetuned_path):
     logging.info("Fine-tuned weights loaded.")
 
 
-def compute_metrics(output_tensor, gt_tensor):
-    """Compute LPIPS and SSIM between output and ground-truth."""
-    import lpips
+def compute_metrics(output_tensor, gt_tensor, lpips_model=None):
+    """Compute LPIPS and SSIM between output and ground-truth.
+
+    Args:
+        output_tensor: [C, T, H, W] generated video tensor in [-1, 1].
+        gt_tensor: [C, T, H, W] ground-truth video tensor in [-1, 1].
+        lpips_model: Optional pre-initialized LPIPS model. If None, creates one.
+    """
     from skimage.metrics import structural_similarity as ssim_fn
 
-    lpips_model = lpips.LPIPS(net="alex").to(output_tensor.device)
-    lpips_model.eval()
+    cleanup_lpips = False
+    if lpips_model is None:
+        import lpips
+        lpips_model = lpips.LPIPS(net="alex").to(output_tensor.device)
+        lpips_model.eval()
+        cleanup_lpips = True
 
     T = min(output_tensor.shape[1], gt_tensor.shape[1])
     lpips_values = []
@@ -158,7 +179,9 @@ def compute_metrics(output_tensor, gt_tensor):
         s = ssim_fn(out_np, gt_np, channel_axis=2, data_range=255)
         ssim_values.append(s)
 
-    del lpips_model
+    if cleanup_lpips:
+        del lpips_model
+
     return {
         "lpips": float(np.mean(lpips_values)),
         "ssim": float(np.mean(ssim_values)),
@@ -171,6 +194,7 @@ def run_single_inference(
     wan_vace, depth_tensor, prompt, output_dir,
     context_scale=0.5, num_inference_steps=50, seed=2025,
     size=(480, 832), frame_num=81, gt_tensor=None, sample_name="output",
+    lpips_model=None,
 ):
     """Run depth-to-RGB generation for a single depth video chunk."""
     device = wan_vace.device
@@ -184,6 +208,7 @@ def run_single_inference(
 
     T = depth_tensor.shape[1]
     if T < frame_num:
+        logging.warning("Depth has %d frames but need %d — padding last frame", T, frame_num)
         pad = depth_tensor[:, -1:, :, :].expand(-1, frame_num - T, -1, -1)
         depth_tensor = torch.cat([depth_tensor, pad], dim=1)
     elif T > frame_num:
@@ -199,11 +224,15 @@ def run_single_inference(
 
     output_video = wan_vace.generate(
         prompt, src_video, src_mask, src_ref_images,
-        size=SIZE_CONFIGS["480p"], frame_num=frame_num,
+        size=(H, W), frame_num=frame_num,
         context_scale=context_scale, shift=16,
         sample_solver="unipc", sampling_steps=num_inference_steps,
         guide_scale=5.0, seed=seed, offload_model=True,
     )
+
+    assert output_video is not None, "Pipeline returned None"
+    if not torch.isfinite(output_video).all():
+        logging.warning("Pipeline output contains NaN/Inf values")
 
     os.makedirs(output_dir, exist_ok=True)
     out_frames = tensor_to_frames(output_video.cpu())
@@ -221,7 +250,7 @@ def run_single_inference(
             ).permute(1, 0, 2, 3)
         if gt_tensor.shape[1] > frame_num:
             gt_tensor = gt_tensor[:, :frame_num, :, :]
-        metrics = compute_metrics(output_video, gt_tensor)
+        metrics = compute_metrics(output_video, gt_tensor, lpips_model=lpips_model)
         logging.info(f"Metrics: LPIPS={metrics['lpips']:.4f}, SSIM={metrics['ssim']:.4f}")
 
         with open(os.path.join(output_dir, f"{sample_name}_metrics.json"), "w") as f:
@@ -294,7 +323,7 @@ def run_autoregressive_inference(
 
         video = wan_vace.generate(
             prompt, src_video, src_mask, src_ref_images,
-            size=SIZE_CONFIGS["480p"], frame_num=chunk_frames,
+            size=(H, W), frame_num=chunk_frames,
             context_scale=context_scale, shift=16,
             sample_solver="unipc", sampling_steps=num_inference_steps,
             guide_scale=5.0, seed=seed, offload_model=True,
@@ -345,21 +374,32 @@ def run_batch_evaluation(
     os.makedirs(output_dir, exist_ok=True)
     all_metrics = []
 
+    # Create LPIPS model once for the entire batch
+    lpips_model = None
+    if os.path.isdir(gt_dir):
+        try:
+            import lpips
+            lpips_model = lpips.LPIPS(net="alex").to(wan_vace.device)
+            lpips_model.eval()
+            logging.info("LPIPS model loaded for batch evaluation")
+        except ImportError:
+            logging.warning("lpips not installed, skipping metrics")
+
     for i, depth_file in enumerate(depth_files):
         depth_path = os.path.join(depth_dir, depth_file)
         sample_name = os.path.splitext(depth_file)[0]
         logging.info(f"[{i+1}/{len(depth_files)}] {sample_name}")
 
-        depth_tensor = load_depth_input(depth_path)
+        depth_tensor = load_video_tensor(depth_path)
         gt_tensor = None
         gt_path = os.path.join(gt_dir, depth_file)
         if os.path.exists(gt_path):
-            gt_tensor = load_depth_input(gt_path)
+            gt_tensor = load_video_tensor(gt_path)
 
         _, metrics = run_single_inference(
             wan_vace, depth_tensor, prompt, output_dir,
             context_scale, num_inference_steps, seed, size, frame_num,
-            gt_tensor, sample_name,
+            gt_tensor, sample_name, lpips_model=lpips_model,
         )
 
         if metrics:
@@ -368,6 +408,8 @@ def run_batch_evaluation(
 
         gc.collect()
         torch.cuda.empty_cache()
+
+    del lpips_model
 
     if all_metrics:
         summary = {
@@ -449,7 +491,7 @@ def main():
         )
     elif args.autoregressive:
         assert args.src_video is not None
-        depth_tensor = load_depth_input(args.src_video)
+        depth_tensor = load_video_tensor(args.src_video)
         run_autoregressive_inference(
             wan_vace, depth_tensor, args.prompt, args.output_dir,
             args.context_scale, args.num_inference_steps, args.seed, size,
@@ -457,10 +499,10 @@ def main():
         )
     else:
         assert args.src_video is not None
-        depth_tensor = load_depth_input(args.src_video)
+        depth_tensor = load_video_tensor(args.src_video)
         gt_tensor = None
         if args.gt_video:
-            gt_tensor = load_depth_input(args.gt_video)
+            gt_tensor = load_video_tensor(args.gt_video)
         run_single_inference(
             wan_vace, depth_tensor, args.prompt, args.output_dir,
             args.context_scale, args.num_inference_steps, args.seed, size,

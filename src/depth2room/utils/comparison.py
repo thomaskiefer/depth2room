@@ -13,6 +13,7 @@ import json
 import os
 
 import imageio
+import matplotlib
 import numpy as np
 import torch
 from PIL import Image, ImageDraw, ImageFont
@@ -21,20 +22,23 @@ from PIL import Image, ImageDraw, ImageFont
 def load_metadata(data_dir):
     """Load metadata.json and index by clip_name."""
     metadata_path = os.path.join(data_dir, "metadata.json")
+    assert os.path.exists(metadata_path), f"metadata.json not found: {metadata_path}"
     with open(metadata_path) as f:
         metadata = json.load(f)
     return {e["clip_name"]: e for e in metadata}
 
 
 def depth_tensor_to_frames(depth_tensor):
-    """Convert depth tensor [3, T, H, W] in [-1,1] to list of PIL Images."""
-    frames = ((depth_tensor + 1) / 2 * 255).clamp(0, 255).byte()
-    num_frames = frames.shape[1]
+    """Convert depth tensor [3, T, H, W] in [-1,1] to turbo-colored PIL Images."""
+    from depth2room.utils import validate_depth_tensor
+    validate_depth_tensor(depth_tensor, label="comparison depth tensor")
+    turbo = matplotlib.colormaps["turbo"]
+    num_frames = depth_tensor.shape[1]
     images = []
     for t in range(num_frames):
-        frame = frames[:, t]
-        img = Image.fromarray(frame.permute(1, 2, 0).numpy())
-        images.append(img)
+        disp_01 = ((depth_tensor[0, t].numpy() + 1.0) / 2.0).clip(0, 1)
+        colored = (turbo(disp_01)[:, :, :3] * 255).clip(0, 255).astype(np.uint8)
+        images.append(Image.fromarray(colored))
     return images
 
 
@@ -85,6 +89,9 @@ def make_side_by_side(eval_dir, scene_name, data_dir, metadata):
     writer.close()
 
     generated_path = os.path.join(scene_dir, "generated.mp4")
+    if not os.path.exists(generated_path):
+        print(f"  Generated video not found: {generated_path}")
+        return None
     reader = imageio.get_reader(generated_path)
     gen_frames = [Image.fromarray(frame) for frame in reader]
     reader.close()

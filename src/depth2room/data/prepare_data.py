@@ -215,8 +215,11 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
     from cad_estate.gl.scene_renderer import render_scene
 
     cad_estate_root = args.cad_estate_root
+    assert os.path.isdir(cad_estate_root), f"cad_estate_root not found: {cad_estate_root}"
     annotations_dir = os.path.join(cad_estate_root, "data", "annotations")
     frames_dir = os.path.join(cad_estate_root, "data", "frames")
+    assert os.path.isdir(annotations_dir), f"annotations dir not found: {annotations_dir}"
+    assert os.path.isdir(frames_dir), f"frames dir not found: {frames_dir}"
 
     num_frames = args.num_frames
     stride = args.stride
@@ -236,7 +239,11 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         f"{clip_name}_rgb.mp4",
         f"{clip_name}_ref.jpg",
     ]
-    if all(os.path.exists(os.path.join(scene_output_dir, f)) for f in expected_files):
+    if all(
+        os.path.exists(os.path.join(scene_output_dir, f))
+        and os.path.getsize(os.path.join(scene_output_dir, f)) > 0
+        for f in expected_files
+    ):
         meta_path = os.path.join(scene_output_dir, f"{clip_name}_depth_meta.json")
         with open(meta_path, "r") as f:
             depth_meta = json.load(f)
@@ -312,6 +319,9 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         rgb_frames = []
         for i in range(num_frames):
             view_proj = frames.camera_intrinsics[i] @ frames.camera_extrinsics[i]
+            assert torch.isfinite(view_proj).all(), (
+                f"Non-finite values in view_proj matrix at frame {i} for {clip_name}"
+            )
 
             result = render_scene(
                 vertex_positions=room.triangles,
@@ -340,9 +350,11 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             rgb_cropped = rgb_cropped.clamp(0, 255).to(torch.uint8)
             rgb_frames.append(rgb_cropped)
 
-        # Stack tensors
+        # Stack tensors and validate
         depth_tensor = torch.stack(depth_frames, dim=1).cpu()
         assert depth_tensor.shape == (3, num_frames, TARGET_H, TARGET_W)
+        from depth2room.utils import validate_depth_tensor
+        validate_depth_tensor(depth_tensor, label=f"output depth for {clip_name}")
 
         rgb_tensor = torch.stack(rgb_frames, dim=0).cpu()
         assert rgb_tensor.shape == (num_frames, 3, TARGET_H, TARGET_W)
@@ -359,6 +371,16 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         raw_depth_path = os.path.join(scene_output_dir, f"{clip_name}_raw_depth.pt")
         torch.save(raw_depth_tensor, raw_depth_path)
 
+        video_path = os.path.join(scene_output_dir, f"{clip_name}_rgb.mp4")
+        save_rgb_video(rgb_tensor, video_path, fps=int(30 / stride))
+
+        # Save reference image from a random frame
+        ref_frame_idx = random.randint(0, num_frames - 1)
+        ref_path = os.path.join(scene_output_dir, f"{clip_name}_ref.jpg")
+        ref_img = rgb_tensor[ref_frame_idx]
+        ref_pil = torchvision.transforms.functional.to_pil_image(ref_img)
+        ref_pil.save(ref_path, quality=95)
+
         depth_meta = {
             "d_min": depth_d_mins,
             "d_max": depth_d_maxs,
@@ -373,16 +395,6 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         depth_meta_path = os.path.join(scene_output_dir, f"{clip_name}_depth_meta.json")
         with open(depth_meta_path, "w") as f:
             json.dump(depth_meta, f)
-
-        video_path = os.path.join(scene_output_dir, f"{clip_name}_rgb.mp4")
-        save_rgb_video(rgb_tensor, video_path, fps=int(30 / stride))
-
-        # Save reference image from a random frame (or skip entirely)
-        ref_frame_idx = random.randint(0, num_frames - 1)
-        ref_path = os.path.join(scene_output_dir, f"{clip_name}_ref.jpg")
-        ref_img = rgb_tensor[ref_frame_idx]
-        ref_pil = torchvision.transforms.functional.to_pil_image(ref_img)
-        ref_pil.save(ref_path, quality=95)
 
         metadata = {
             "clip_name": clip_name,
@@ -500,6 +512,10 @@ def main():
                     log.info("Progress: %d/%d scenes (%d skipped, %d failed)",
                              done_count, len(scenes), skipped, failed)
 
+    assert len(metadata_list) > 0, (
+        f"No scenes were successfully processed out of {len(scenes)} attempted"
+    )
+
     metadata_path = os.path.join(args.output_dir, "metadata.json")
     with open(metadata_path, "w") as f:
         json.dump(metadata_list, f, indent=2)
@@ -507,6 +523,9 @@ def main():
     log.info("Done. %d scenes total (%d new, %d skipped, %d failed).",
              len(metadata_list), len(metadata_list) - skipped, skipped, failed)
     log.info("Metadata saved to %s", metadata_path)
+    if failed > 0:
+        log.warning("%.1f%% of scenes failed processing (%d/%d).",
+                     100 * failed / len(scenes), failed, len(scenes))
 
 
 if __name__ == "__main__":

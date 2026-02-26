@@ -100,6 +100,11 @@ def main():
     if missing_files > 0:
         print(f"Warning: {missing_files} scenes had missing files on disk")
 
+    assert len(rows) > 0, (
+        f"No valid rows produced from {len(metadata_list)} metadata entries and "
+        f"{len(captions)} captions ({missing_caption} missing captions, {missing_files} missing files)"
+    )
+
     random.shuffle(rows)
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)

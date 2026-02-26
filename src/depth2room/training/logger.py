@@ -6,10 +6,14 @@ without modifying the upstream library. Logs training loss, step count,
 epoch checkpoints, and training completion events.
 """
 
+import logging
+import math
 import os
 import torch
 from accelerate import Accelerator
 from diffsynth.diffusion.logger import ModelLogger as _BaseModelLogger
+
+log = logging.getLogger(__name__)
 
 
 class ModelLogger(_BaseModelLogger):
@@ -51,13 +55,23 @@ class ModelLogger(_BaseModelLogger):
                     save_steps=None, **kwargs):
         self.num_steps += 1
 
-        if self.wandb_active and accelerator.is_main_process:
-            import wandb
-            log_dict = {"train/step": self.num_steps}
+        if accelerator.is_main_process:
             loss = kwargs.get("loss")
+            loss_val = None
             if loss is not None:
-                log_dict["train/loss"] = loss.item() if hasattr(loss, "item") else float(loss)
-            wandb.log(log_dict, step=self.num_steps)
+                loss_val = loss.item() if hasattr(loss, "item") else float(loss)
+                if not math.isfinite(loss_val):
+                    log.error("Step %d: NaN/Inf loss detected (loss=%s)", self.num_steps, loss_val)
+
+            if self.wandb_active:
+                import wandb
+                log_dict = {"train/step": self.num_steps}
+                if loss_val is not None:
+                    log_dict["train/loss"] = loss_val
+                lr = kwargs.get("learning_rate")
+                if lr is not None:
+                    log_dict["train/learning_rate"] = lr
+                wandb.log(log_dict, step=self.num_steps)
 
         if save_steps is not None and self.num_steps % save_steps == 0:
             self.save_model(accelerator, model, f"step-{self.num_steps}.safetensors")

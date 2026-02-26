@@ -41,7 +41,7 @@ accelerate launch \
     --num_frames 81 \
     --learning_rate 1e-4 \
     --num_epochs 5 \
-    --save_steps 200 \
+    --save_steps 500 \
     --use_gradient_checkpointing \
     --dataset_num_workers 0 \
     --gradient_accumulation_steps 1

@@ -20,43 +20,96 @@ import os
 import random
 import shutil
 
+import matplotlib
+import numpy as np
 import torch
 from PIL import Image
 
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.utils.data import save_video
-from depth2room.training.training_unit import replace_vace_unit
+from depth2room.inference import load_pipeline
+from depth2room.utils import validate_depth_tensor
 
 
-def load_pipeline(model_dir, checkpoint_path=None, lora_alpha=1.0, device="cuda"):
-    """Load the VACE pipeline with optional LoRA checkpoint."""
-    print("Loading base VACE pipeline...")
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=device,
-        model_configs=[
-            ModelConfig(f"{model_dir}/diffusion_pytorch_model.safetensors"),
-            ModelConfig(f"{model_dir}/models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(f"{model_dir}/Wan2.1_VAE.pth"),
-        ],
-        tokenizer_config=ModelConfig(f"{model_dir}/google/umt5-xxl"),
-    )
+def compute_eval_metrics(gen_frames, gt_video_path, device="cpu"):
+    """Compute LPIPS and SSIM between generated frames and ground-truth video.
 
-    pipe = replace_vace_unit(pipe)
-    print("Replaced VACE unit with depth-aware version")
+    Args:
+        gen_frames: List of PIL Images (generated video frames).
+        gt_video_path: Path to ground-truth mp4 video.
+        device: torch device for LPIPS computation.
 
-    if checkpoint_path is not None:
-        print(f"Loading LoRA checkpoint: {checkpoint_path}")
-        pipe.load_lora(pipe.vace, checkpoint_path, alpha=lora_alpha)
-        print(f"LoRA loaded (alpha={lora_alpha})")
+    Returns:
+        Dict with avg and per-frame LPIPS/SSIM, or None if GT unavailable.
+    """
+    if not os.path.exists(gt_video_path):
+        return None
 
-    return pipe
+    try:
+        import cv2
+        import lpips
+        from skimage.metrics import structural_similarity as ssim_fn
+    except ImportError:
+        print("  Metrics skipped (install depth2room[eval] for LPIPS/SSIM)")
+        return None
+
+    # Load GT frames
+    cap = cv2.VideoCapture(gt_video_path)
+    gt_frames = []
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        gt_frames.append(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+    cap.release()
+
+    n = min(len(gen_frames), len(gt_frames))
+    if n == 0:
+        return None
+
+    lpips_model = lpips.LPIPS(net="alex").to(device)
+    lpips_model.eval()
+
+    lpips_vals = []
+    ssim_vals = []
+
+    for t in range(n):
+        gen_np = np.array(gen_frames[t])
+        gt_np = gt_frames[t]
+
+        # Resize GT to match generated if needed
+        if gt_np.shape[:2] != gen_np.shape[:2]:
+            gt_np = np.array(Image.fromarray(gt_np).resize(
+                (gen_np.shape[1], gen_np.shape[0]), Image.LANCZOS
+            ))
+
+        # LPIPS: expects [1, 3, H, W] in [-1, 1]
+        gen_t = torch.from_numpy(gen_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+        gt_t = torch.from_numpy(gt_np).float().permute(2, 0, 1).unsqueeze(0) / 127.5 - 1.0
+
+        with torch.no_grad():
+            lp = lpips_model(gen_t.to(device), gt_t.to(device)).item()
+        lpips_vals.append(lp)
+
+        s = ssim_fn(gen_np, gt_np, channel_axis=2, data_range=255)
+        ssim_vals.append(float(s))
+
+    del lpips_model
+
+    return {
+        "lpips": float(np.mean(lpips_vals)),
+        "ssim": float(np.mean(ssim_vals)),
+        "lpips_per_frame": lpips_vals,
+        "ssim_per_frame": ssim_vals,
+        "num_frames_compared": n,
+    }
 
 
 def select_eval_scenes(data_dir, num_scenes, seed=42):
     """Select random scenes for evaluation."""
     metadata_path = os.path.join(data_dir, "metadata.json")
     captions_path = os.path.join(data_dir, "captions.json")
+    assert os.path.exists(metadata_path), f"metadata.json not found: {metadata_path}"
+    assert os.path.exists(captions_path), f"captions.json not found: {captions_path}"
 
     with open(metadata_path) as f:
         metadata = json.load(f)
@@ -82,9 +135,10 @@ def select_eval_scenes(data_dir, num_scenes, seed=42):
 
 
 def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
-             seed=42, with_ref=True):
+             seed=42, with_ref=True, compute_metrics=True):
     """Run inference on selected scenes and save results."""
     os.makedirs(output_dir, exist_ok=True)
+    all_metrics = []
 
     for i, scene in enumerate(scenes):
         clip_name = scene["clip_name"]
@@ -92,12 +146,7 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
         print(f"  Prompt: {scene['prompt'][:100]}...")
 
         depth_tensor = torch.load(scene["depth_path"], map_location="cpu", weights_only=True)
-        assert depth_tensor.ndim == 4 and depth_tensor.shape[0] == 3, (
-            f"Expected depth tensor [3, T, H, W], got {depth_tensor.shape}"
-        )
-        assert depth_tensor.min() >= -1.0 - 1e-3 and depth_tensor.max() <= 1.0 + 1e-3, (
-            f"Depth tensor values out of [-1, 1] range: [{depth_tensor.min():.4f}, {depth_tensor.max():.4f}]"
-        )
+        validate_depth_tensor(depth_tensor, label=f"depth for {clip_name}")
         print(f"  Depth: {depth_tensor.shape}, range [{depth_tensor.min():.2f}, {depth_tensor.max():.2f}]")
 
         ref_image = None
@@ -124,6 +173,9 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
         scene_dir = os.path.join(output_dir, clip_name)
         os.makedirs(scene_dir, exist_ok=True)
 
+        # Validate pipeline output
+        assert video is not None and len(video) > 0, f"Pipeline returned empty output for {clip_name}"
+
         gen_path = os.path.join(scene_dir, "generated.mp4")
         save_video(video, gen_path, fps=16, quality=5)
         print(f"  Saved: {gen_path}")
@@ -135,12 +187,33 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
         if ref_image is not None:
             ref_image.save(os.path.join(scene_dir, "reference.jpg"))
 
+        # Save depth keyframes as turbo-colored images
+        turbo = matplotlib.colormaps["turbo"]
         for frame_idx, frame_name in [(0, "depth_first"), (40, "depth_mid"), (80, "depth_last")]:
             if frame_idx < depth_tensor.shape[1]:
-                depth_frame = depth_tensor[:, frame_idx]
-                depth_img = ((depth_frame + 1) / 2 * 255).clamp(0, 255).byte()
-                depth_pil = Image.fromarray(depth_img.permute(1, 2, 0).numpy())
-                depth_pil.save(os.path.join(scene_dir, f"{frame_name}.jpg"))
+                disp_01 = ((depth_tensor[0, frame_idx].numpy() + 1.0) / 2.0).clip(0, 1)
+                colored = (turbo(disp_01)[:, :, :3] * 255).clip(0, 255).astype(np.uint8)
+                Image.fromarray(colored).save(os.path.join(scene_dir, f"{frame_name}.jpg"))
+
+        # Save full depth video as turbo-colored mp4
+        depth_video_frames = []
+        for t in range(depth_tensor.shape[1]):
+            disp_01 = ((depth_tensor[0, t].numpy() + 1.0) / 2.0).clip(0, 1)
+            colored = (turbo(disp_01)[:, :, :3] * 255).clip(0, 255).astype(np.uint8)
+            depth_video_frames.append(Image.fromarray(colored))
+        depth_video_path = os.path.join(scene_dir, "depth.mp4")
+        save_video(depth_video_frames, depth_video_path, fps=16, quality=5)
+
+        # Compute metrics against ground truth
+        scene_metrics = None
+        if compute_metrics and os.path.exists(scene["rgb_path"]):
+            print(f"  Computing metrics...")
+            scene_metrics = compute_eval_metrics(video, gt_path)
+            if scene_metrics:
+                print(f"  LPIPS={scene_metrics['lpips']:.4f}, SSIM={scene_metrics['ssim']:.4f}")
+                all_metrics.append({"clip_name": clip_name, **scene_metrics})
+                with open(os.path.join(scene_dir, "metrics.json"), "w") as f:
+                    json.dump(scene_metrics, f, indent=2)
 
         with open(os.path.join(scene_dir, "info.json"), "w") as f:
             json.dump({
@@ -152,7 +225,24 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
                 "with_ref": ref_image is not None,
             }, f, indent=2)
 
-    print(f"\nEvaluation complete. Results in {output_dir}")
+    # Write aggregate summary
+    summary = {
+        "num_scenes": len(scenes),
+        "num_inference_steps": num_inference_steps,
+        "cfg_scale": cfg_scale,
+        "seed": seed,
+        "with_ref": with_ref,
+    }
+    if all_metrics:
+        summary["avg_lpips"] = float(np.mean([m["lpips"] for m in all_metrics]))
+        summary["avg_ssim"] = float(np.mean([m["ssim"] for m in all_metrics]))
+        summary["per_scene"] = all_metrics
+        print(f"\nAggregate: LPIPS={summary['avg_lpips']:.4f}, SSIM={summary['avg_ssim']:.4f}")
+
+    with open(os.path.join(output_dir, "summary.json"), "w") as f:
+        json.dump(summary, f, indent=2)
+
+    print(f"Evaluation complete. Results in {output_dir}")
 
 
 def main():
@@ -169,6 +259,8 @@ def main():
     parser.add_argument("--cfg_scale", type=float, default=5.0)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--no_ref", action="store_true")
+    parser.add_argument("--no_metrics", action="store_true",
+                        help="Skip LPIPS/SSIM computation against ground truth.")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -185,7 +277,8 @@ def main():
     pipe = load_pipeline(args.model_dir, args.checkpoint, args.lora_alpha, args.device)
     run_eval(pipe, scenes, args.output_dir,
              num_inference_steps=args.steps, cfg_scale=args.cfg_scale,
-             seed=args.seed, with_ref=not args.no_ref)
+             seed=args.seed, with_ref=not args.no_ref,
+             compute_metrics=not args.no_metrics)
 
 
 if __name__ == "__main__":

@@ -42,5 +42,5 @@ accelerate launch \
     --use_gradient_checkpointing_offload \
     --initialize_model_on_cpu \
     --dataset_num_workers 4 \
-    --save_steps 200 \
+    --save_steps 500 \
     --gradient_accumulation_steps 1

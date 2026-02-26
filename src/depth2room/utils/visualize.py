@@ -9,6 +9,7 @@ Usage:
 
 import argparse
 import json
+import os
 
 import av
 import matplotlib
@@ -36,10 +37,25 @@ def main():
     out_dir = args.data_dir
     clip = args.clip
 
-    depth = torch.load(f"{out_dir}/{clip}_depth.pt", map_location="cpu", weights_only=True)
-    raw_depth = torch.load(f"{out_dir}/{clip}_raw_depth.pt", map_location="cpu", weights_only=True)
-    with open(f"{out_dir}/{clip}_depth_meta.json") as f:
+    depth_path = f"{out_dir}/{clip}_depth.pt"
+    raw_depth_path = f"{out_dir}/{clip}_raw_depth.pt"
+    meta_path = f"{out_dir}/{clip}_depth_meta.json"
+    rgb_path = f"{out_dir}/{clip}_rgb.mp4"
+
+    for path in [depth_path, raw_depth_path, meta_path, rgb_path]:
+        assert os.path.exists(path), f"File not found: {path}"
+
+    depth = torch.load(depth_path, map_location="cpu", weights_only=True)
+    raw_depth = torch.load(raw_depth_path, map_location="cpu", weights_only=True)
+    with open(meta_path) as f:
         meta = json.load(f)
+
+    assert depth.ndim == 4 and depth.shape[0] == 3, (
+        f"Expected depth tensor [3, T, H, W], got {depth.shape}"
+    )
+    assert raw_depth.ndim == 4 and raw_depth.shape[0] == 1, (
+        f"Expected raw_depth tensor [1, T, H, W], got {raw_depth.shape}"
+    )
 
     print(f"Depth shape: {depth.shape}, range: [{depth.min():.4f}, {depth.max():.4f}]")
     print(f"Raw depth shape: {raw_depth.shape}, range: [{raw_depth.min():.4f}, {raw_depth.max():.4f}]")

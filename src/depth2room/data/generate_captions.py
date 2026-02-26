@@ -109,13 +109,14 @@ def build_fallback_caption(scene_id: str, annotations_dir: str) -> str:
         return f"An indoor scene showing a room interior. The camera slowly pans across the space, revealing the room layout and architectural features. Soft natural lighting fills the environment."
 
     parts = []
+    elem_plurals = {"wall": "walls", "floor": "floors", "ceiling": "ceilings", "slanted": "slanted surfaces"}
     for elem_type in ["wall", "floor", "ceiling", "slanted"]:
         count = counts.get(elem_type, 0)
         if count > 0:
             if count == 1:
-                parts.append(f"{count} {elem_type}")
+                parts.append(f"{count} {elem_type}" if elem_type != "slanted" else f"{count} slanted surface")
             else:
-                parts.append(f"{count} {elem_type}s")
+                parts.append(f"{count} {elem_plurals[elem_type]}")
 
     if len(parts) == 1:
         elements_str = parts[0]

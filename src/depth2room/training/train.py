@@ -15,13 +15,24 @@ Usage:
         --output_path /path/to/output
 """
 
-import torch
 import argparse
-import accelerate
+import logging
+import os
 import warnings
 
+import accelerate
+import torch
+
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-from diffsynth.diffusion import *
+from diffsynth.diffusion import (
+    DiffusionTrainingModule,
+    FlowMatchSFTLoss,
+    DirectDistillLoss,
+    add_general_config,
+    add_video_size_config,
+    launch_training_task,
+    launch_data_process_task,
+)
 
 from depth2room.training.dataset import VACEDepthDataset
 from depth2room.training.training_unit import replace_vace_unit
@@ -110,7 +121,10 @@ class WanDepthTrainingModule(DiffusionTrainingModule):
             if extra_input == "vace_video_tensor":
                 # Route the pre-computed depth tensor to vace_video
                 # The depth-aware unit will detect it's already a tensor and skip preprocess_video
-                inputs_shared["vace_video"] = data.get("vace_video_tensor")
+                depth = data.get("vace_video_tensor")
+                if depth is None:
+                    logging.warning("vace_video_tensor is None — training on zero-depth fallback")
+                inputs_shared["vace_video"] = depth
             elif extra_input == "input_image":
                 inputs_shared["input_image"] = data["video"][0]
             elif extra_input == "end_image":
@@ -170,6 +184,8 @@ class WanDepthTrainingModule(DiffusionTrainingModule):
         for unit in self.pipe.units:
             inputs = self.pipe.unit_runner(unit, self.pipe, *inputs)
         loss = self.task_to_loss[self.task](self.pipe, *inputs)
+        if not torch.isfinite(loss):
+            logging.error("Non-finite loss detected: %s", loss.item())
         return loss
 
 
@@ -182,6 +198,8 @@ def depth_train_parser():
     parser.add_argument("--max_timestep_boundary", type=float, default=1.0, help="Max timestep boundary.")
     parser.add_argument("--min_timestep_boundary", type=float, default=0.0, help="Min timestep boundary.")
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Initialize models on CPU.")
+    parser.add_argument("--dry_run", default=False, action="store_true",
+                        help="Load one sample, run one forward pass, print shapes/loss, then exit.")
     return parser
 
 
@@ -235,12 +253,37 @@ if __name__ == "__main__":
         wandb_config=vars(args),
         wandb_run_name=f"lora-r{args.lora_rank}-lr{args.learning_rate}" if args.lora_base_model else f"full-lr{args.learning_rate}",
     )
-    launcher_map = {
-        "sft:data_process": launch_data_process_task,
-        "direct_distill:data_process": launch_data_process_task,
-        "sft": launch_training_task,
-        "sft:train": launch_training_task,
-        "direct_distill": launch_training_task,
-        "direct_distill:train": launch_training_task,
-    }
-    launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+    if args.dry_run:
+        print("\n=== DRY RUN: loading one sample and running one forward pass ===")
+        data = dataset[0]
+        print(f"  prompt: {data['prompt'][:80]}...")
+        print(f"  video: {len(data['video'])} frames, size={data['video'][0].size}")
+        depth = data.get("vace_video_tensor")
+        if depth is not None:
+            print(f"  depth: shape={depth.shape}, dtype={depth.dtype}, "
+                  f"range=[{depth.min():.3f}, {depth.max():.3f}]")
+        else:
+            print("  depth: None")
+        ref = data.get("vace_reference_image")
+        print(f"  reference: {'yes' if ref else 'no'}")
+
+        # Save debug artifacts
+        debug_dir = os.path.join(args.output_path, "dry_run")
+        dataset.save_debug_sample(0, debug_dir)
+        print(f"  Debug artifacts saved to {debug_dir}")
+
+        # Forward pass
+        model.to(accelerator.device)
+        loss = model(data)
+        print(f"  loss: {loss.item():.6f} (finite={torch.isfinite(loss).item()})")
+        print("=== DRY RUN COMPLETE ===")
+    else:
+        launcher_map = {
+            "sft:data_process": launch_data_process_task,
+            "direct_distill:data_process": launch_data_process_task,
+            "sft": launch_training_task,
+            "sft:train": launch_training_task,
+            "direct_distill": launch_training_task,
+            "direct_distill:train": launch_training_task,
+        }
+        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)

@@ -26,9 +26,9 @@ import torch
 import torch.nn.functional as F
 from PIL import Image
 
-from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.utils.data import save_video
-from depth2room.training.training_unit import replace_vace_unit
+from depth2room.inference import load_pipeline
+from depth2room.utils import validate_depth_tensor
 
 
 def load_exr_depth_z(exr_path: str) -> np.ndarray:
@@ -213,31 +213,6 @@ def get_reference_image(exr_path: str, height: int = 480,
         return None
 
 
-def load_pipeline(model_dir, checkpoint_path=None, lora_alpha=1.0, device="cuda"):
-    """Load the VACE pipeline with optional LoRA checkpoint."""
-    print("Loading base VACE pipeline...")
-    pipe = WanVideoPipeline.from_pretrained(
-        torch_dtype=torch.bfloat16,
-        device=device,
-        model_configs=[
-            ModelConfig(f"{model_dir}/diffusion_pytorch_model.safetensors"),
-            ModelConfig(f"{model_dir}/models_t5_umt5-xxl-enc-bf16.pth"),
-            ModelConfig(f"{model_dir}/Wan2.1_VAE.pth"),
-        ],
-        tokenizer_config=ModelConfig(f"{model_dir}/google/umt5-xxl"),
-    )
-
-    pipe = replace_vace_unit(pipe)
-    print("Replaced VACE unit with depth-aware version")
-
-    if checkpoint_path is not None:
-        print(f"Loading LoRA checkpoint: {checkpoint_path}")
-        pipe.load_lora(pipe.vace, checkpoint_path, alpha=lora_alpha)
-        print(f"LoRA loaded (alpha={lora_alpha})")
-
-    return pipe
-
-
 def main():
     parser = argparse.ArgumentParser(description="Run VACE depth-to-RGB from EXR files.")
     parser.add_argument("--model_dir", type=str, required=True,
@@ -268,9 +243,18 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
+    assert os.path.isdir(args.scene_dir), f"Scene directory not found: {args.scene_dir}"
+    assert os.path.isdir(args.model_dir), f"Model directory not found: {args.model_dir}"
+    if args.checkpoint is not None:
+        assert os.path.exists(args.checkpoint), f"Checkpoint not found: {args.checkpoint}"
+
     all_frames = gather_all_exr_frames(args.scene_dir)
+    assert len(all_frames) > 0, f"No EXR frames found in {args.scene_dir}"
     print(f"Total frames across all arcs: {len(all_frames)}")
 
+    assert args.start_frame < len(all_frames), (
+        f"start_frame ({args.start_frame}) >= total frames ({len(all_frames)})"
+    )
     end_frame = min(args.start_frame + args.num_frames, len(all_frames))
     selected = all_frames[args.start_frame:end_frame]
     actual_frames = snap_frame_count(len(selected))
@@ -291,6 +275,7 @@ def main():
     depth_tensor = build_depth_tensor(selected, height=480, width=832, z_far=args.z_far,
                                       use_mist=args.use_mist, per_frame=args.per_frame,
                                       percentile=args.percentile)
+    validate_depth_tensor(depth_tensor, label="built depth tensor")
     print(f"Depth tensor: {depth_tensor.shape}, range [{depth_tensor.min():.2f}, {depth_tensor.max():.2f}]")
 
     ref_image = None
@@ -317,6 +302,8 @@ def main():
         num_inference_steps=args.steps,
         sigma_shift=5.0,
     )
+
+    assert video is not None and len(video) > 0, "Pipeline returned empty output"
 
     gen_path = os.path.join(args.output_dir, "generated.mp4")
     save_video(video, gen_path, fps=16, quality=5)

@@ -18,6 +18,7 @@ import os
 
 import torch
 from diffsynth.core.data.unified_dataset import UnifiedDataset
+from depth2room.utils import validate_depth_tensor
 from diffsynth.core.data.operators import (
     ToAbsolutePath,
     LoadImage,
@@ -42,24 +43,7 @@ class LoadDepthTensor(DataProcessingOperator):
             path = os.path.join(self.base_path, path)
 
         tensor = torch.load(path, map_location="cpu", weights_only=True)
-
-        # Assertions: validate the depth tensor
-        assert isinstance(tensor, torch.Tensor), (
-            f"Depth file must contain a torch.Tensor, got {type(tensor)}"
-        )
-        assert tensor.ndim == 4, (
-            f"Depth tensor must be 4D [C, T, H, W], got shape {tensor.shape}"
-        )
-        assert tensor.shape[0] == 3, (
-            f"Depth tensor channel dim must be 3, got {tensor.shape[0]}"
-        )
-        assert tensor.dtype == torch.float32, (
-            f"Depth tensor must be float32, got {tensor.dtype}"
-        )
-        assert tensor.min() >= -1.0 - 1e-3 and tensor.max() <= 1.0 + 1e-3, (
-            f"Depth tensor values must be in [-1, 1], got min={tensor.min():.4f} max={tensor.max():.4f}"
-        )
-
+        validate_depth_tensor(tensor, label=f"depth file {path}")
         return tensor
 
 
@@ -142,6 +126,47 @@ class VACEDepthDataset(torch.utils.data.Dataset):
             for key in keys_to_remove:
                 del row[key]
         self.data = self.unified_dataset.data
+
+    def save_debug_sample(self, idx, output_dir):
+        """Save a single sample's components as image files for visual inspection.
+
+        Saves: first/last RGB frames, first/last depth frames, reference image.
+        Useful for verifying data loading before training.
+        """
+        from PIL import Image as PILImage
+
+        os.makedirs(output_dir, exist_ok=True)
+        data = self[idx]
+
+        # Save first and last RGB frames
+        for i, label in [(0, "first"), (len(data["video"]) - 1, "last")]:
+            data["video"][i].save(os.path.join(output_dir, f"rgb_{label}.jpg"))
+
+        # Save depth frames as grayscale images
+        depth = data.get("vace_video_tensor")
+        if depth is not None:
+            for i, label in [(0, "first"), (depth.shape[1] - 1, "last")]:
+                frame = ((depth[0, i] + 1) / 2 * 255).clamp(0, 255).byte().numpy()
+                PILImage.fromarray(frame, mode="L").save(
+                    os.path.join(output_dir, f"depth_{label}.jpg")
+                )
+
+        # Save reference image
+        ref = data.get("vace_reference_image")
+        if ref is not None and isinstance(ref, list) and len(ref) > 0:
+            ref[0].save(os.path.join(output_dir, "reference.jpg"))
+
+        # Save metadata
+        import json
+        meta = {
+            "idx": idx,
+            "prompt": data.get("prompt", ""),
+            "num_video_frames": len(data["video"]),
+            "depth_shape": list(depth.shape) if depth is not None else None,
+            "has_reference": ref is not None,
+        }
+        with open(os.path.join(output_dir, "debug_info.json"), "w") as f:
+            json.dump(meta, f, indent=2)
 
     def __len__(self):
         return len(self.unified_dataset)

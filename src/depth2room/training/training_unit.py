@@ -11,6 +11,7 @@ import torch
 from einops import rearrange
 
 from diffsynth.pipelines.wan_video import WanVideoPipeline, WanVideoUnit_VACE
+from depth2room.utils import validate_depth_tensor
 
 
 class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):
@@ -46,13 +47,7 @@ class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):
             elif isinstance(vace_video, torch.Tensor) and vace_video.ndim == 4:
                 # Float tensor depth input: [C, T, H, W] -> [1, C, T, H, W]
                 # Already in [-1, 1] range, skip preprocess_video()
-                assert vace_video.dtype in (torch.float32, torch.float16, torch.bfloat16), (
-                    f"Depth tensor must be a float type, got {vace_video.dtype}"
-                )
-                assert vace_video.min() >= -1.0 - 1e-3 and vace_video.max() <= 1.0 + 1e-3, (
-                    f"Depth tensor values must be in [-1, 1], "
-                    f"got min={vace_video.min():.4f} max={vace_video.max():.4f}"
-                )
+                validate_depth_tensor(vace_video, label="vace_video input")
                 vace_video = vace_video.unsqueeze(0).to(dtype=pipe.torch_dtype, device=pipe.device)
             else:
                 # Standard PIL Image list path (fallback)
@@ -73,8 +68,15 @@ class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):
             reactive = vace_video * vace_video_mask + 0 * (1 - vace_video_mask)
             inactive = pipe.vae.encode(inactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
             reactive = pipe.vae.encode(reactive, device=pipe.device, tiled=tiled, tile_size=tile_size, tile_stride=tile_stride).to(dtype=pipe.torch_dtype, device=pipe.device)
+            assert torch.isfinite(inactive).all(), "NaN/Inf in inactive latents after VAE encode"
+            assert torch.isfinite(reactive).all(), "NaN/Inf in reactive latents after VAE encode"
             vace_video_latents = torch.concat((inactive, reactive), dim=1)
 
+            mask_h, mask_w = vace_video_mask.shape[3], vace_video_mask.shape[4]
+            assert mask_h % 8 == 0 and mask_w % 8 == 0, (
+                f"Mask spatial dims must be divisible by 8 for patchification, "
+                f"got {mask_h}x{mask_w}"
+            )
             vace_mask_latents = rearrange(vace_video_mask[0, 0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8)
             vace_mask_latents = torch.nn.functional.interpolate(
                 vace_mask_latents,

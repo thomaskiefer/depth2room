@@ -44,6 +44,7 @@ inference = [
 eval = [
     "lpips",
     "scikit-image",
+    "opencv-python",
 ]
 all = ["depth2room[training,data,inference,eval]"]
 
