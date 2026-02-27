@@ -50,11 +50,7 @@ export VACE_ROOT=/path/to/Wan2.1/vace
 ## Training
 
 ```bash
-# Full fine-tuning
 bash scripts/train_full.sh
-
-# LoRA fine-tuning
-bash scripts/train_lora.sh
 ```
 
 ## Project Structure

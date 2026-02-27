@@ -55,8 +55,6 @@ class WanDepthTrainingModule(DiffusionTrainingModule):
         model_paths=None, model_id_with_origin_paths=None,
         tokenizer_path=None, audio_processor_path=None,
         trainable_models=None,
-        lora_base_model=None, lora_target_modules="", lora_rank=32, lora_checkpoint=None,
-        preset_lora_path=None, preset_lora_model=None,
         use_gradient_checkpointing=True,
         use_gradient_checkpointing_offload=False,
         extra_inputs=None,
@@ -83,13 +81,34 @@ class WanDepthTrainingModule(DiffusionTrainingModule):
         self.pipe = replace_vace_unit(self.pipe)
         print("Replaced WanVideoUnit_VACE with WanVideoUnit_VACE_Depth")
 
-        self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, lora_base_model)
+        # Expand Context Embedder: 96 -> 160 input channels for validity mask
+        # New 64 channels are zero-initialized so model starts from pretrained behavior
+        old_conv = self.pipe.vace.vace_patch_embedding
+        in_ch_old = old_conv.weight.shape[1]  # 96
+        in_ch_new = in_ch_old + 64            # 160
+        out_ch = old_conv.weight.shape[0]
+        new_conv = torch.nn.Conv3d(
+            in_ch_new, out_ch,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        new_conv = new_conv.to(device=old_conv.weight.device, dtype=old_conv.weight.dtype)
+        new_conv.weight.data.zero_()
+        new_conv.weight.data[:, :in_ch_old] = old_conv.weight.data
+        if old_conv.bias is not None:
+            new_conv.bias.data = old_conv.bias.data.clone()
+        self.pipe.vace.vace_patch_embedding = new_conv
+        print(f"Expanded vace_patch_embedding: {in_ch_old} -> {in_ch_new} input channels")
 
-        # Training mode
+        self.pipe = self.split_pipeline_units(task, self.pipe, trainable_models, None)
+
+        # Training mode (full fine-tuning only, no LoRA)
         self.switch_pipe_to_training_mode(
             self.pipe, trainable_models,
-            lora_base_model, lora_target_modules, lora_rank, lora_checkpoint,
-            preset_lora_path, preset_lora_model,
+            None, "", 32, None,
+            None, None,
             task=task,
         )
 
@@ -125,6 +144,8 @@ class WanDepthTrainingModule(DiffusionTrainingModule):
                 if depth is None:
                     logging.warning("vace_video_tensor is None — training on zero-depth fallback")
                 inputs_shared["vace_video"] = depth
+            elif extra_input == "vace_validity_mask":
+                inputs_shared["vace_validity_mask"] = data.get("vace_validity_mask")
             elif extra_input == "input_image":
                 inputs_shared["input_image"] = data["video"][0]
             elif extra_input == "end_image":
@@ -230,12 +251,6 @@ if __name__ == "__main__":
         tokenizer_path=args.tokenizer_path,
         audio_processor_path=args.audio_processor_path,
         trainable_models=args.trainable_models,
-        lora_base_model=args.lora_base_model,
-        lora_target_modules=args.lora_target_modules,
-        lora_rank=args.lora_rank,
-        lora_checkpoint=args.lora_checkpoint,
-        preset_lora_path=args.preset_lora_path,
-        preset_lora_model=args.preset_lora_model,
         use_gradient_checkpointing=args.use_gradient_checkpointing,
         use_gradient_checkpointing_offload=args.use_gradient_checkpointing_offload,
         extra_inputs=args.extra_inputs,
@@ -251,7 +266,7 @@ if __name__ == "__main__":
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         wandb_project="vace-depth-finetune",
         wandb_config=vars(args),
-        wandb_run_name=f"lora-r{args.lora_rank}-lr{args.learning_rate}" if args.lora_base_model else f"full-lr{args.learning_rate}",
+        wandb_run_name=f"full-lr{args.learning_rate}",
     )
     if args.dry_run:
         print("\n=== DRY RUN: loading one sample and running one forward pass ===")
@@ -264,6 +279,12 @@ if __name__ == "__main__":
                   f"range=[{depth.min():.3f}, {depth.max():.3f}]")
         else:
             print("  depth: None")
+        validity = data.get("vace_validity_mask")
+        if validity is not None:
+            print(f"  validity mask: shape={validity.shape}, "
+                  f"valid_frac={validity.mean():.3f}")
+        else:
+            print("  validity mask: None")
         ref = data.get("vace_reference_image")
         print(f"  reference: {'yes' if ref else 'no'}")
 

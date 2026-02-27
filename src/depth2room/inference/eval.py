@@ -124,11 +124,13 @@ def select_eval_scenes(data_dir, num_scenes, seed=42):
     scenes = []
     for entry in selected:
         clip_name = entry["clip_name"]
+        validity_path = entry.get("validity_path", "")
         scenes.append({
             "clip_name": clip_name,
             "depth_path": os.path.join(data_dir, entry["depth_path"]),
             "rgb_path": os.path.join(data_dir, entry["rgb_path"]),
             "ref_path": os.path.join(data_dir, entry["ref_path"]),
+            "validity_path": os.path.join(data_dir, validity_path) if validity_path else "",
             "prompt": captions[clip_name],
         })
     return scenes
@@ -149,6 +151,11 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
         validate_depth_tensor(depth_tensor, label=f"depth for {clip_name}")
         print(f"  Depth: {depth_tensor.shape}, range [{depth_tensor.min():.2f}, {depth_tensor.max():.2f}]")
 
+        validity_mask = None
+        if scene.get("validity_path") and os.path.exists(scene["validity_path"]):
+            validity_mask = torch.load(scene["validity_path"], map_location="cpu", weights_only=True)
+            print(f"  Validity mask: {validity_mask.shape}, valid fraction: {validity_mask.mean():.3f}")
+
         ref_image = None
         if with_ref and os.path.exists(scene["ref_path"]):
             ref_image = Image.open(scene["ref_path"]).convert("RGB")
@@ -160,6 +167,7 @@ def run_eval(pipe, scenes, output_dir, num_inference_steps=50, cfg_scale=5.0,
             negative_prompt="blurry, low quality, distorted, ugly",
             vace_video=depth_tensor,
             vace_reference_image=ref_image,
+            vace_validity_mask=validity_mask,
             vace_scale=1.0,
             seed=seed,
             height=480,
@@ -250,8 +258,7 @@ def main():
     parser.add_argument("--model_dir", type=str, required=True,
                         help="Path to VACE model directory (e.g. models/Wan2.1-VACE-1.3B/).")
     parser.add_argument("--checkpoint", type=str, default=None,
-                        help="Path to LoRA .safetensors checkpoint.")
-    parser.add_argument("--lora_alpha", type=float, default=1.0)
+                        help="Path to fine-tuned .safetensors checkpoint.")
     parser.add_argument("--scenes", type=int, default=5)
     parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--data_dir", type=str, required=True)
@@ -274,7 +281,7 @@ def main():
     scenes = select_eval_scenes(args.data_dir, args.scenes, seed=args.seed)
     print(f"Selected {len(scenes)} scenes for evaluation")
 
-    pipe = load_pipeline(args.model_dir, args.checkpoint, args.lora_alpha, args.device)
+    pipe = load_pipeline(args.model_dir, args.checkpoint, args.device)
     run_eval(pipe, scenes, args.output_dir,
              num_inference_steps=args.steps, cfg_scale=args.cfg_scale,
              seed=args.seed, with_ref=not args.no_ref,

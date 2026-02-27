@@ -47,6 +47,24 @@ class LoadDepthTensor(DataProcessingOperator):
         return tensor
 
 
+class LoadValidityMask(DataProcessingOperator):
+    """Load a .pt validity mask file [1, T, H, W] with values 0.0/1.0."""
+
+    def __init__(self, base_path=""):
+        self.base_path = base_path
+
+    def __call__(self, data):
+        path = data
+        if not os.path.isabs(path):
+            path = os.path.join(self.base_path, path)
+
+        tensor = torch.load(path, map_location="cpu", weights_only=True)
+        assert tensor.ndim == 4 and tensor.shape[0] == 1, (
+            f"Validity mask must be [1, T, H, W], got {tensor.shape}"
+        )
+        return tensor
+
+
 class VACEDepthDataset(torch.utils.data.Dataset):
     """
     Dataset for VACE depth-conditioned video generation training.
@@ -79,6 +97,7 @@ class VACEDepthDataset(torch.utils.data.Dataset):
     ):
         self.base_path = base_path
         self.depth_loader = LoadDepthTensor(base_path=base_path)
+        self.validity_loader = LoadValidityMask(base_path=base_path)
 
         # Build the underlying UnifiedDataset for standard columns.
         # 'vace_video' is handled via special_operator_map to keep it as raw path,
@@ -195,6 +214,19 @@ class VACEDepthDataset(torch.utils.data.Dataset):
             data["vace_video_tensor"] = depth_tensor
         else:
             data["vace_video_tensor"] = None
+
+        # Load validity mask from the vace_validity_mask column
+        validity_path = raw_row.get("vace_validity_mask", "")
+        if validity_path:
+            validity_mask = self.validity_loader(validity_path)
+            if data["vace_video_tensor"] is not None:
+                assert validity_mask.shape[1] == data["vace_video_tensor"].shape[1], (
+                    f"Validity mask has {validity_mask.shape[1]} frames but depth has "
+                    f"{data['vace_video_tensor'].shape[1]} frames"
+                )
+            data["vace_validity_mask"] = validity_mask
+        else:
+            data["vace_validity_mask"] = None
 
         # Handle empty vace_reference_image (CSV has empty string for no-ref rows)
         if "vace_reference_image" not in data or data.get("vace_reference_image") in ("", None):

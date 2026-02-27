@@ -88,9 +88,15 @@ def main():
         include_ref = ref_path and (random.random() >= args.no_ref_fraction)
         ref_rel = ref_path if include_ref else ""
 
+        validity_path = entry.get("validity_path", "")
+        if validity_path and not os.path.exists(os.path.join(args.data_dir, validity_path)):
+            missing_files += 1
+            continue
+
         rows.append({
             "video": rgb_path,
             "vace_video": depth_path,
+            "vace_validity_mask": validity_path,
             "vace_reference_image": ref_rel,
             "prompt": prompt,
         })
@@ -109,7 +115,7 @@ def main():
 
     os.makedirs(os.path.dirname(os.path.abspath(args.output_csv)), exist_ok=True)
     with open(args.output_csv, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["video", "vace_video", "vace_reference_image", "prompt"])
+        writer = csv.DictWriter(f, fieldnames=["video", "vace_video", "vace_validity_mask", "vace_reference_image", "prompt"])
         writer.writeheader()
         writer.writerows(rows)
 

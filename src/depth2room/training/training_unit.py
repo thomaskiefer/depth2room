@@ -8,6 +8,7 @@ Contains:
 """
 
 import torch
+import torch.nn.functional as F
 from einops import rearrange
 
 from diffsynth.pipelines.wan_video import WanVideoPipeline, WanVideoUnit_VACE
@@ -16,28 +17,40 @@ from depth2room.utils import validate_depth_tensor
 
 class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):
     """
-    Subclassed VACE unit that handles float tensor depth input.
+    Subclassed VACE unit that handles float tensor depth input + validity mask.
 
     When vace_video is already a float tensor in [-1, 1] range, it skips
     preprocess_video() and uses the tensor directly. An all-ones mask is
     applied as default (standard VACE inpainting behavior: treat the entire
     depth video as the "active" region).
 
-    The rest of the 96-channel encoding proceeds identically to the base class:
+    The 160-channel encoding:
       - inactive = vace_video * (1 - mask)  [all zeros since mask is all ones]
       - reactive = vace_video * mask         [the depth video itself]
-      - Both are VAE-encoded, concatenated along channel dim
-      - Mask is downsampled to latent space
-      - If reference image is provided, its latents are prepended
-      - Final vace_context = concat(video_latents, mask_latents) along channel dim
+      - Both are VAE-encoded → 16ch each = 32ch
+      - Edit mask is patchified (8x8) → 64ch
+      - Validity mask is patchified (8x8) → 64ch
+      - vace_context = concat(video_latents, mask_latents, validity_latents) = 160ch
+      - If reference image is provided, its latents are prepended temporally
     """
+
+    def __init__(self):
+        super().__init__()
+        # Extend input_params to include vace_validity_mask so the
+        # PipelineUnitRunner forwards it from inputs_shared to process().
+        self.input_params = (
+            "vace_video", "vace_video_mask", "vace_reference_image", "vace_scale",
+            "height", "width", "num_frames", "tiled", "tile_size", "tile_stride",
+            "vace_validity_mask",
+        )
 
     def process(
         self,
         pipe: WanVideoPipeline,
         vace_video, vace_video_mask, vace_reference_image, vace_scale,
         height, width, num_frames,
-        tiled, tile_size, tile_stride
+        tiled, tile_size, tile_stride,
+        vace_validity_mask=None,
     ):
         if vace_video is not None or vace_video_mask is not None or vace_reference_image is not None:
             pipe.load_models_to_device(["vae"])
@@ -84,6 +97,22 @@ class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):
                 mode='nearest-exact',
             )
 
+            # Patchify validity mask (same spatial decomposition as edit mask)
+            if vace_validity_mask is not None and isinstance(vace_validity_mask, torch.Tensor) and vace_validity_mask.ndim == 4:
+                vm = vace_validity_mask.to(dtype=pipe.torch_dtype, device=pipe.device)
+                # [1, T, H, W] -> patchify 8x8 -> [1, 64, T, H/8, W/8]
+                validity_latents = rearrange(vm[0], "T (H P) (W Q) -> 1 (P Q) T H W", P=8, Q=8)
+                validity_latents = F.interpolate(
+                    validity_latents,
+                    size=vace_mask_latents.shape[2:],
+                    mode='nearest-exact',
+                )
+            else:
+                # No validity mask: default to all-valid (ones).
+                # Before training this doesn't matter (zero-init weights × anything = 0).
+                # After training, ones = "all pixels valid" which is the safe default.
+                validity_latents = torch.ones_like(vace_mask_latents)
+
             if vace_reference_image is None:
                 pass
             else:
@@ -106,19 +135,63 @@ class WanVideoUnit_VACE_Depth(WanVideoUnit_VACE):
 
                 vace_video_latents = torch.concat((*vace_reference_latents, vace_video_latents), dim=2)
                 vace_mask_latents = torch.concat((torch.zeros_like(vace_mask_latents[:, :, :f]), vace_mask_latents), dim=2)
+                # Reference frames get zero validity (no depth info for reference image)
+                validity_latents = torch.concat((torch.zeros_like(validity_latents[:, :, :f]), validity_latents), dim=2)
 
-            vace_context = torch.concat((vace_video_latents, vace_mask_latents), dim=1)
+            vace_context = torch.concat((vace_video_latents, vace_mask_latents, validity_latents), dim=1)
 
-            # Assertion: VACE context must have 96 channels
-            # inactive(16ch) + reactive(16ch) + mask(64ch) = 96 channels
-            assert vace_context.shape[1] == 96, (
-                f"VACE context must have 96 channels, got {vace_context.shape[1]}. "
+            # Assertion: VACE context must have 160 channels
+            # inactive(16ch) + reactive(16ch) + edit_mask(64ch) + validity_mask(64ch) = 160
+            assert vace_context.shape[1] == 160, (
+                f"VACE context must have 160 channels, got {vace_context.shape[1]}. "
                 f"Shape: {vace_context.shape}"
             )
 
             return {"vace_context": vace_context, "vace_scale": vace_scale}
         else:
             return {"vace_context": None, "vace_scale": vace_scale}
+
+
+def patch_pipeline_for_validity_mask(pipe: WanVideoPipeline):
+    """Patch the pipeline's __call__ to accept and forward vace_validity_mask.
+
+    WanVideoPipeline.__call__() has a fixed signature that doesn't include
+    vace_validity_mask. We create a dynamic subclass and reassign pipe.__class__
+    so that pipe(...) resolves to our patched __call__ via normal class MRO.
+
+    Note: instance-level __call__ assignment (types.MethodType) does NOT work
+    because Python's implicit special-method lookup for pipe(...) uses
+    type(pipe).__call__, bypassing instance __dict__.
+    """
+    original_cls = pipe.__class__
+    original_call = original_cls.__call__
+
+    class _PatchedPipeline(original_cls):
+        def __call__(self, *args, vace_validity_mask=None, **kwargs):
+            if vace_validity_mask is not None:
+                real_runner = self.unit_runner
+
+                class _PatchedRunner:
+                    def __init__(self, real, mask):
+                        self.real = real
+                        self.mask = mask
+
+                    def __call__(self, unit, pipe_arg, inputs_shared, *rest):
+                        if isinstance(unit, WanVideoUnit_VACE_Depth):
+                            inputs_shared["vace_validity_mask"] = self.mask
+                        return self.real(unit, pipe_arg, inputs_shared, *rest)
+
+                self.unit_runner = _PatchedRunner(real_runner, vace_validity_mask)
+                try:
+                    result = original_call(self, *args, **kwargs)
+                finally:
+                    self.unit_runner = real_runner
+                return result
+            else:
+                return original_call(self, *args, **kwargs)
+
+    pipe.__class__ = _PatchedPipeline
+    return pipe
 
 
 def replace_vace_unit(pipe: WanVideoPipeline):

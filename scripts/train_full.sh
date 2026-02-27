@@ -30,7 +30,7 @@ accelerate launch \
     --tokenizer_path "${VACE_MODEL_DIR}/google/umt5-xxl" \
     --dataset_base_path "${DATA_DIR}" \
     --dataset_metadata_path "${METADATA_CSV}" \
-    --extra_inputs "vace_video_tensor,vace_reference_image" \
+    --extra_inputs "vace_video_tensor,vace_reference_image,vace_validity_mask" \
     --output_path "${OUTPUT_DIR}" \
     --remove_prefix_in_ckpt "pipe.vace." \
     --trainable_models "vace" \

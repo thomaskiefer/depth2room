@@ -7,7 +7,7 @@ VACE fine-tuning.
 
 Frame sampling: picks a random consecutive window of (num_frames * stride)
 source frames, then takes every `stride`-th frame to produce `num_frames`
-output frames at approximately 16fps (source is ~30fps, stride=2 → ~15fps).
+output frames at 16fps (matching Wan2.1/VACE training fps).
 
 Outputs are organized into per-video subdirectories:
     {output_dir}/{video_id}/{clip_name}_depth.pt
@@ -105,85 +105,8 @@ def discover_scenes(struct_all_path: str, frames_dir: str,
     return sorted(usable)
 
 
-# ---------------------------------------------------------------------------
-# Center-crop + resize transform
-# ---------------------------------------------------------------------------
-def center_crop_resize(img: torch.Tensor, target_h: int,
-                       target_w: int) -> torch.Tensor:
-    """Center-crop and resize a [C, H, W] or [H, W] tensor to target size."""
-    if img.ndim == 2:
-        h, w = img.shape
-        unsqueeze = True
-        img = img.unsqueeze(0)
-    else:
-        assert img.ndim == 3
-        _, h, w = img.shape
-        unsqueeze = False
+from depth2room.utils import center_crop_resize, normalize_depth_clip
 
-    scale = max(target_h / h, target_w / w)
-    new_h = int(round(h * scale))
-    new_w = int(round(w * scale))
-    assert new_h >= target_h and new_w >= target_w
-
-    img_float = img.unsqueeze(0).float()
-    img_resized = torch.nn.functional.interpolate(
-        img_float, size=(new_h, new_w), mode="bilinear", align_corners=False
-    )
-    img_resized = img_resized.squeeze(0)
-
-    top = (new_h - target_h) // 2
-    left = (new_w - target_w) // 2
-    img_cropped = img_resized[:, top:top + target_h, left:left + target_w]
-
-    assert img_cropped.shape[-2:] == (target_h, target_w)
-
-    if unsqueeze:
-        img_cropped = img_cropped.squeeze(0)
-
-    return img_cropped
-
-
-# ---------------------------------------------------------------------------
-# Depth processing
-# ---------------------------------------------------------------------------
-def process_depth_frame(depth: torch.Tensor, z_far: float,
-                        eps: float = 1e-8) -> tuple[torch.Tensor, float, float]:
-    """Convert raw linear depth to normalized disparity in [-1, 1].
-
-    Follows MiDaS convention: per-frame min-max normalization of disparity.
-
-    Args:
-        depth: [H, W] float32 linear depth (gl_Position.w)
-        z_far: far plane value
-        eps: epsilon for numerical stability
-
-    Returns:
-        Tuple of:
-          - [3, H, W] float32 tensor in [-1, 1], 3-channel (grayscale replicated)
-          - d_min: float, minimum disparity value for this frame
-          - d_max: float, maximum disparity value for this frame
-    """
-    valid = (depth > 0) & (depth < z_far)
-    assert valid.any(), "No valid depth pixels in frame"
-
-    disparity = torch.zeros_like(depth)
-    disparity[valid] = 1.0 / depth[valid]
-
-    # Per-frame min-max normalize
-    d_min = disparity[valid].min()
-    d_max = disparity[valid].max()
-    disparity_01 = (disparity - d_min) / (d_max - d_min + eps)
-    disparity_01[~valid] = 0.0
-
-    # Convert to [-1, 1]
-    disparity_normalized = 2.0 * disparity_01 - 1.0
-    disparity_normalized[~valid] = 0.0
-
-    assert disparity_normalized.min() >= -1.0 - eps
-    assert disparity_normalized.max() <= 1.0 + eps
-
-    depth_rgb = disparity_normalized.unsqueeze(0).expand(3, -1, -1).contiguous()
-    return depth_rgb, float(d_min), float(d_max)
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +161,7 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         f"{clip_name}_depth_meta.json",
         f"{clip_name}_rgb.mp4",
         f"{clip_name}_ref.jpg",
+        f"{clip_name}_validity.pt",
     ]
     if all(
         os.path.exists(os.path.join(scene_output_dir, f))
@@ -258,6 +182,7 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             "depth_path": os.path.join(video_id, f"{clip_name}_depth.pt"),
             "rgb_path": os.path.join(video_id, f"{clip_name}_rgb.mp4"),
             "ref_path": os.path.join(video_id, f"{clip_name}_ref.jpg"),
+            "validity_path": os.path.join(video_id, f"{clip_name}_validity.pt"),
             "ref_frame_idx": depth_meta.get("ref_frame_idx"),
             "skipped": True,
         }
@@ -312,10 +237,7 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
                         clip_name, json_w, json_h, src_w, src_h)
 
         # Render depth for each frame
-        depth_frames = []
         raw_depth_frames = []
-        depth_d_mins = []
-        depth_d_maxs = []
         rgb_frames = []
         for i in range(num_frames):
             view_proj = frames.camera_intrinsics[i] @ frames.camera_extrinsics[i]
@@ -340,15 +262,15 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             depth_cropped = center_crop_resize(depth_raw.to(device), TARGET_H, TARGET_W)
             raw_depth_frames.append(depth_cropped.clone())
 
-            depth_processed, d_min, d_max = process_depth_frame(depth_cropped, z_far=z_far)
-            depth_frames.append(depth_processed)
-            depth_d_mins.append(d_min)
-            depth_d_maxs.append(d_max)
-
             rgb_frame = frames.frame_images[i].float().to(device)
             rgb_cropped = center_crop_resize(rgb_frame, TARGET_H, TARGET_W)
             rgb_cropped = rgb_cropped.clamp(0, 255).to(torch.uint8)
             rgb_frames.append(rgb_cropped)
+
+        # Per-clip global normalization with percentile clipping
+        depth_frames, d_min, d_max = normalize_depth_clip(
+            raw_depth_frames, z_far=z_far,
+        )
 
         # Stack tensors and validate
         depth_tensor = torch.stack(depth_frames, dim=1).cpu()
@@ -362,6 +284,10 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         raw_depth_tensor = torch.stack(raw_depth_frames, dim=0).unsqueeze(0).cpu()
         assert raw_depth_tensor.shape == (1, num_frames, TARGET_H, TARGET_W)
 
+        # Compute validity mask: 1 where depth is valid, 0 where invalid
+        validity_mask = ((raw_depth_tensor > 0) & (raw_depth_tensor < z_far)).float()
+        assert validity_mask.shape == (1, num_frames, TARGET_H, TARGET_W)
+
         # Save outputs
         os.makedirs(scene_output_dir, exist_ok=True)
 
@@ -371,8 +297,11 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         raw_depth_path = os.path.join(scene_output_dir, f"{clip_name}_raw_depth.pt")
         torch.save(raw_depth_tensor, raw_depth_path)
 
+        validity_path = os.path.join(scene_output_dir, f"{clip_name}_validity.pt")
+        torch.save(validity_mask, validity_path)
+
         video_path = os.path.join(scene_output_dir, f"{clip_name}_rgb.mp4")
-        save_rgb_video(rgb_tensor, video_path, fps=int(30 / stride))
+        save_rgb_video(rgb_tensor, video_path, fps=16)
 
         # Save reference image from a random frame
         ref_frame_idx = random.randint(0, num_frames - 1)
@@ -382,15 +311,18 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         ref_pil.save(ref_path, quality=95)
 
         depth_meta = {
-            "d_min": depth_d_mins,
-            "d_max": depth_d_maxs,
+            "d_min": d_min,
+            "d_max": d_max,
+            "normalization": "global_percentile",
+            "percentile_low": 1.0,
+            "percentile_high": 99.0,
             "z_far": z_far,
             "stride": stride,
             "source_start_idx": int(start_idx),
             "source_resolution": [src_h, src_w],
             "ref_frame_idx": ref_frame_idx,
             "source_fps": 30,
-            "effective_fps": 30 / stride,
+            "effective_fps": 16,
         }
         depth_meta_path = os.path.join(scene_output_dir, f"{clip_name}_depth_meta.json")
         with open(depth_meta_path, "w") as f:
@@ -407,6 +339,7 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
             "depth_path": os.path.join(video_id, os.path.basename(depth_path)),
             "rgb_path": os.path.join(video_id, os.path.basename(video_path)),
             "ref_path": os.path.join(video_id, os.path.basename(ref_path)),
+            "validity_path": os.path.join(video_id, os.path.basename(validity_path)),
             "ref_frame_idx": ref_frame_idx,
         }
 
@@ -424,11 +357,21 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
 # ---------------------------------------------------------------------------
 # Worker wrapper for multiprocessing
 # ---------------------------------------------------------------------------
+def _seed_rngs(seed: int):
+    """Seed all RNGs for reproducibility within a single scene."""
+    random.seed(seed)
+    np.random.seed(seed % (2**32))
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
 def _worker(args_tuple):
     """Unpack arguments for process_scene (ProcessPoolExecutor compatibility)."""
-    clip_name, args, worker_gpu = args_tuple
+    clip_name, args, worker_gpu, scene_seed = args_tuple
     os.environ["CUDA_VISIBLE_DEVICES"] = str(worker_gpu)
     torch.set_num_threads(1)
+    _seed_rngs(scene_seed)
     return process_scene(clip_name, args)
 
 
@@ -459,6 +402,8 @@ def main():
     parser.add_argument("--stride", type=int, default=2)
     parser.add_argument("--z_far", type=float, default=200.0)
     parser.add_argument("--min_source_frames", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducible frame/ref selection.")
     args = parser.parse_args()
 
     if args.cad_estate_src is None:
@@ -466,6 +411,13 @@ def main():
 
     if args.min_source_frames is None:
         args.min_source_frames = args.num_frames * args.stride
+
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    # NOTE: Do NOT call torch.cuda.manual_seed_all() here — it initializes
+    # CUDA in the parent process, which breaks ProcessPoolExecutor (fork).
+    # CUDA seeding happens per-worker inside _seed_rngs().
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -479,6 +431,10 @@ def main():
         scenes = scenes[:args.max_scenes]
     log.info("Will process %d scenes", len(scenes))
 
+    # Pre-generate deterministic per-scene seeds so each scene always gets the
+    # same random choices regardless of worker count or completion order.
+    scene_seeds = {clip_name: random.randint(0, 2**31 - 1) for clip_name in scenes}
+
     metadata_list = []
     failed = 0
     skipped = 0
@@ -486,6 +442,7 @@ def main():
     if args.num_workers <= 1:
         for i, clip_name in enumerate(scenes):
             log.info("[%d/%d] Processing %s", i + 1, len(scenes), clip_name)
+            _seed_rngs(scene_seeds[clip_name])
             result = process_scene(clip_name, args)
             if result is not None:
                 if result.get("skipped"):
@@ -495,7 +452,8 @@ def main():
                 failed += 1
     else:
         num_gpus = max(1, torch.cuda.device_count())
-        work_items = [(clip_name, args, i % num_gpus) for i, clip_name in enumerate(scenes)]
+        work_items = [(clip_name, args, i % num_gpus, scene_seeds[clip_name])
+                      for i, clip_name in enumerate(scenes)]
         with ProcessPoolExecutor(max_workers=args.num_workers) as executor:
             futures = {executor.submit(_worker, item): item[0] for item in work_items}
             done_count = 0
@@ -511,6 +469,10 @@ def main():
                 if done_count % 50 == 0 or done_count == len(scenes):
                     log.info("Progress: %d/%d scenes (%d skipped, %d failed)",
                              done_count, len(scenes), skipped, failed)
+
+    # Sort results into original scene order for deterministic metadata.json
+    scene_order = {name: i for i, name in enumerate(scenes)}
+    metadata_list.sort(key=lambda m: scene_order.get(m["clip_name"], len(scenes)))
 
     assert len(metadata_list) > 0, (
         f"No scenes were successfully processed out of {len(scenes)} attempted"

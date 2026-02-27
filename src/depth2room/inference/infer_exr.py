@@ -20,15 +20,13 @@ import os
 import re
 from pathlib import Path
 
-import matplotlib.cm as cm
 import numpy as np
 import torch
-import torch.nn.functional as F
 from PIL import Image
 
 from diffsynth.utils.data import save_video
 from depth2room.inference import load_pipeline
-from depth2room.utils import validate_depth_tensor
+from depth2room.utils import center_crop_resize, normalize_depth_clip, validate_depth_tensor
 
 
 def load_exr_depth_z(exr_path: str) -> np.ndarray:
@@ -72,48 +70,29 @@ def load_exr_rgb(exr_path: str) -> np.ndarray:
     raise ValueError(f"No RGB channel found in {exr_path}")
 
 
-def depth_to_disparity_raw(depth: np.ndarray, z_far: float = 200.0,
-                           min_filter_size: int = 6, eps: float = 1e-8) -> np.ndarray:
-    """Convert Z-depth to disparity with minimum filter for edge artifact removal."""
+def apply_minimum_filter(depth: np.ndarray, min_filter_size: int = 6,
+                         z_far: float = 200.0, eps: float = 1e-8) -> torch.Tensor:
+    """Convert Z-depth to raw linear depth tensor with minimum filter for edge artifacts.
+
+    The minimum filter shrinks foreground edges, reducing depth-discontinuity
+    artifacts from EXR rendering. Returns a [H, W] torch tensor of raw linear
+    depth (NOT disparity) suitable for normalize_depth_clip().
+    """
     from scipy.ndimage import minimum_filter
 
     valid = (depth > eps) & (depth < z_far) & np.isfinite(depth)
     assert valid.any(), "No valid depth pixels in frame"
 
+    # Apply minimum filter in disparity space (shrinks foreground edges)
     disparity = np.zeros_like(depth)
     disparity[valid] = 1.0 / depth[valid]
     disparity = minimum_filter(disparity, size=min_filter_size)
-    return disparity.astype(np.float32)
 
-
-def compute_global_range(exr_paths: list[str], z_far: float = 200.0,
-                         min_filter_size: int = 6) -> tuple[float, float]:
-    """Compute global disparity min/max across all frames."""
-    global_min = float("inf")
-    global_max = float("-inf")
-
-    for exr_path in exr_paths:
-        depth = load_exr_depth_z(exr_path)
-        disp = depth_to_disparity_raw(depth, z_far=z_far, min_filter_size=min_filter_size)
-        valid = disp > 0
-        if valid.any():
-            global_min = min(global_min, float(disp[valid].min()))
-            global_max = max(global_max, float(disp[valid].max()))
-
-    return global_min, global_max
-
-
-def normalize_disparity(disparity: np.ndarray, d_min: float, d_max: float,
-                        eps: float = 1e-8) -> np.ndarray:
-    """Normalize disparity to [-1, 1] using global min/max."""
-    valid = disparity > 0
-    disp_01 = np.zeros_like(disparity)
-    disp_01[valid] = (disparity[valid] - d_min) / (d_max - d_min + eps)
-    disp_01 = np.clip(disp_01, 0, 1)
-
-    normalized = 2.0 * disp_01 - 1.0
-    normalized[~valid] = 0.0
-    return normalized.astype(np.float32)
+    # Convert back to linear depth for normalize_depth_clip()
+    filtered_depth = np.zeros_like(depth)
+    disp_valid = disparity > 0
+    filtered_depth[disp_valid] = 1.0 / disparity[disp_valid]
+    return torch.from_numpy(filtered_depth).float()
 
 
 def snap_frame_count(n: int) -> int:
@@ -146,68 +125,84 @@ def gather_all_exr_frames(scene_dir: str) -> list[str]:
 
 def build_depth_tensor(exr_paths: list[str], height: int = 480, width: int = 832,
                        z_far: float = 200.0, min_filter_size: int = 6,
-                       use_mist: bool = False, per_frame: bool = False,
+                       use_mist: bool = False,
                        percentile: float = 1.0) -> torch.Tensor:
     """Load EXR depth frames, process, normalize, build tensor.
+
+    Uses the same pipeline as training data prep:
+      1. Load raw linear depth as torch tensors
+      2. Center-crop + resize to target resolution
+      3. Per-clip global normalization via normalize_depth_clip()
 
     Returns [3, T, height, width] float32 tensor in [-1, 1].
     """
     source = "Mist" if use_mist else "Z-depth"
-    norm = "per-frame" if per_frame else "global"
-    print(f"  Loading {source}, {norm} normalization, {percentile}th percentile filtering" +
+    print(f"  Loading {source}, global normalization, "
+          f"p{percentile}/p{100-percentile} percentile clipping" +
           ("" if use_mist else f", min_filter={min_filter_size}") + "...")
 
-    raw_disparities = []
+    # Step 1: Load raw linear depth as torch tensors
+    raw_depth_frames = []
     for exr_path in exr_paths:
         if use_mist:
             dist = load_exr_mist(exr_path)
-            valid = (dist > 1e-8) & (dist < z_far) & np.isfinite(dist)
-            disp = np.zeros_like(dist)
-            disp[valid] = 1.0 / dist[valid]
+            raw_depth_frames.append(torch.from_numpy(dist).float())
         else:
             depth = load_exr_depth_z(exr_path)
-            disp = depth_to_disparity_raw(depth, z_far=z_far, min_filter_size=min_filter_size)
-        raw_disparities.append(disp)
+            raw_depth_frames.append(
+                apply_minimum_filter(depth, min_filter_size=min_filter_size, z_far=z_far)
+            )
 
-    if per_frame:
-        frames = []
-        for disp in raw_disparities:
-            valid = disp > 0
-            if valid.any():
-                valid_vals = disp[valid]
-                d_min = float(np.percentile(valid_vals, percentile))
-                d_max = float(np.percentile(valid_vals, 100.0 - percentile))
-            else:
-                d_min, d_max = 0.0, 1.0
-            normalized = normalize_disparity(disp, d_min, d_max)
-            frames.append(normalized)
-    else:
-        all_valid = np.concatenate([d[d > 0] for d in raw_disparities])
-        raw_min, raw_max = float(all_valid.min()), float(all_valid.max())
-        d_min = float(np.percentile(all_valid, percentile))
-        d_max = float(np.percentile(all_valid, 100.0 - percentile))
-        print(f"  Global disparity range (p{percentile}-p{100-percentile}): [{d_min:.6f}, {d_max:.6f}]")
-        print(f"  (Raw min/max: [{raw_min:.6f}, {raw_max:.6f}])")
-        frames = [normalize_disparity(disp, d_min, d_max) for disp in raw_disparities]
+    # Step 2: Center-crop + resize (same order as training data prep)
+    resized_frames = [center_crop_resize(f, height, width) for f in raw_depth_frames]
 
-    depth_stack = torch.from_numpy(np.stack(frames, axis=0)).float()
-    depth_stack = depth_stack.unsqueeze(1)
-    depth_stack = F.interpolate(depth_stack, size=(height, width),
-                                mode="bilinear", align_corners=False)
-    depth_stack = depth_stack.squeeze(1)
-    depth_tensor = depth_stack.unsqueeze(0).expand(3, -1, -1, -1).contiguous()
+    # Step 3: Per-clip global normalization with percentile clipping
+    normalized_frames, d_min, d_max = normalize_depth_clip(
+        resized_frames, z_far=z_far,
+        percentile_low=percentile, percentile_high=100.0 - percentile,
+    )
+    print(f"  Global disparity range (p{percentile}-p{100-percentile}): "
+          f"[{d_min:.6f}, {d_max:.6f}]")
+
+    # Step 4: Stack [3, H, W] frames into [3, T, H, W]
+    depth_tensor = torch.stack(normalized_frames, dim=1)
     return depth_tensor
+
+
+def build_validity_mask(exr_paths: list[str], height: int = 480, width: int = 832,
+                        z_far: float = 200.0) -> torch.Tensor:
+    """Build [1, T, H, W] validity mask from EXR depth files.
+
+    Returns float32 tensor: 1.0 = valid depth, 0.0 = invalid/hole.
+    """
+    # Use center-crop + resize (same as training data prep) with nearest mode
+    # to avoid aspect-ratio warping
+    resized_masks = []
+    for exr_path in exr_paths:
+        depth = load_exr_depth_z(exr_path)
+        valid = (depth > 1e-8) & (depth < z_far) & np.isfinite(depth)
+        mask_t = torch.from_numpy(valid.astype(np.float32))  # [H, W]
+        # center_crop_resize uses bilinear, so threshold at 0.5 to keep it binary
+        resized = center_crop_resize(mask_t, height, width)
+        resized_masks.append((resized >= 0.5).float())
+    mask_stack = torch.stack(resized_masks, dim=0)  # [T, H, W]
+    return mask_stack.unsqueeze(0)  # [1, T, H, W]
 
 
 def get_reference_image(exr_path: str, height: int = 480,
                         width: int = 832) -> Image.Image | None:
-    """Extract reference image (RGB) from the first EXR frame."""
+    """Extract reference image (RGB) from the first EXR frame.
+
+    Uses center-crop + resize (same as training data prep) to avoid
+    aspect-ratio warping.
+    """
     try:
         rgb = load_exr_rgb(exr_path)
-        rgb_uint8 = (rgb * 255).clip(0, 255).astype(np.uint8)
-        img = Image.fromarray(rgb_uint8)
-        img = img.resize((width, height), Image.LANCZOS)
-        return img
+        # [H, W, 3] float32 -> torch [3, H, W] for center_crop_resize
+        rgb_t = torch.from_numpy(rgb).float().permute(2, 0, 1)
+        rgb_t = center_crop_resize(rgb_t, height, width)
+        rgb_uint8 = (rgb_t.permute(1, 2, 0).numpy() * 255).clip(0, 255).astype(np.uint8)
+        return Image.fromarray(rgb_uint8)
     except Exception as e:
         print(f"  Could not extract reference image: {e}")
         return None
@@ -220,7 +215,6 @@ def main():
     parser.add_argument("--scene_dir", type=str, required=True,
                         help="Scene directory containing arc subdirectories.")
     parser.add_argument("--checkpoint", type=str, default=None)
-    parser.add_argument("--lora_alpha", type=float, default=1.0)
     parser.add_argument("--prompt", type=str,
                         default="A realistic furnished residential apartment, indoor overhead "
                                 "lighting and daylight from rooms, white and light gray walls, "
@@ -238,7 +232,6 @@ def main():
     parser.add_argument("--z_far", type=float, default=200.0)
     parser.add_argument("--no_ref", action="store_true")
     parser.add_argument("--use_mist", action="store_true")
-    parser.add_argument("--per_frame", action="store_true")
     parser.add_argument("--percentile", type=float, default=1.0)
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
@@ -273,10 +266,14 @@ def main():
 
     print("Building depth tensor...")
     depth_tensor = build_depth_tensor(selected, height=480, width=832, z_far=args.z_far,
-                                      use_mist=args.use_mist, per_frame=args.per_frame,
+                                      use_mist=args.use_mist,
                                       percentile=args.percentile)
     validate_depth_tensor(depth_tensor, label="built depth tensor")
     print(f"Depth tensor: {depth_tensor.shape}, range [{depth_tensor.min():.2f}, {depth_tensor.max():.2f}]")
+
+    print("Building validity mask...")
+    validity_mask = build_validity_mask(selected, height=480, width=832, z_far=args.z_far)
+    print(f"Validity mask: {validity_mask.shape}, valid fraction: {validity_mask.mean():.3f}")
 
     ref_image = None
     if not args.no_ref:
@@ -284,7 +281,7 @@ def main():
         if ref_image:
             print(f"Reference image: {ref_image.size}")
 
-    pipe = load_pipeline(args.model_dir, args.checkpoint, args.lora_alpha, args.device)
+    pipe = load_pipeline(args.model_dir, args.checkpoint, args.device)
 
     print(f"\nGenerating ({args.steps} steps, cfg={args.cfg_scale}, "
           f"seed={args.seed}, frames={actual_frames})...")
@@ -293,6 +290,7 @@ def main():
         negative_prompt="blurry, low quality, distorted, ugly",
         vace_video=depth_tensor,
         vace_reference_image=ref_image,
+        vace_validity_mask=validity_mask,
         vace_scale=1.0,
         seed=args.seed,
         height=480,
@@ -337,7 +335,7 @@ def main():
             "total_frames_available": len(all_frames),
             "with_ref": ref_image is not None,
             "depth_source": "mist" if args.use_mist else "zdepth",
-            "normalization": "per_frame" if args.per_frame else "global",
+            "normalization": "global_percentile",
             "percentile": args.percentile,
             "first_exr": selected[0],
             "last_exr": selected[-1],

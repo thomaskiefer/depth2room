@@ -7,7 +7,7 @@ Requires the VACE repository. Set VACE_ROOT to point at the vace directory:
 
 Supports:
   - Single depth video inference (from .pt tensor or .mp4)
-  - Optional LoRA or full fine-tuned weight loading
+  - Optional fine-tuned weight loading
   - Autoregressive long video generation (81-frame chunks)
   - Batch evaluation with LPIPS / SSIM metrics against ground-truth
 """
@@ -111,32 +111,17 @@ def save_video(frames, path, fps=16):
     writer.close()
 
 
-def load_lora_weights(model, lora_path, alpha=1.0):
-    """Fuse LoRA weights into the model."""
-    # Try to find DiffSynth-Studio's GeneralLoRALoader
-    try:
-        from diffsynth.utils.lora.general import GeneralLoRALoader
-    except ImportError:
-        raise ImportError(
-            "Could not import GeneralLoRALoader. Install diffsynth-studio: "
-            "pip install 'depth2room[training]'"
-        )
-
-    logging.info(f"Loading LoRA weights from {lora_path} (alpha={alpha})")
-    if lora_path.endswith(".safetensors"):
-        from safetensors.torch import load_file
-        lora_state_dict = load_file(lora_path, device="cpu")
-    else:
-        lora_state_dict = torch.load(lora_path, map_location="cpu", weights_only=True)
-    loader = GeneralLoRALoader(device="cpu", torch_dtype=torch.float32)
-    loader.fuse_lora_to_base_model(model, lora_state_dict, alpha=alpha)
-    logging.info("LoRA weights fused successfully.")
-
-
 def load_finetuned_weights(model, finetuned_path):
-    """Load full fine-tuned DiT weights into the model."""
+    """Load full fine-tuned DiT weights into the model.
+
+    Supports both .safetensors (from training logger) and .pt/.bin (legacy).
+    """
     logging.info(f"Loading fine-tuned weights from {finetuned_path}")
-    state_dict = torch.load(finetuned_path, map_location="cpu", weights_only=True)
+    if finetuned_path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        state_dict = load_file(finetuned_path)
+    else:
+        state_dict = torch.load(finetuned_path, map_location="cpu", weights_only=True)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         logging.warning(f"Missing keys: {missing[:10]}...")
@@ -428,8 +413,6 @@ def get_parser():
 
     parser.add_argument("--model_path", type=str, required=True)
     parser.add_argument("--model_name", type=str, default="vace-1.3B", choices=list(WAN_CONFIGS.keys()))
-    parser.add_argument("--lora_path", type=str, default=None)
-    parser.add_argument("--lora_alpha", type=float, default=1.0)
     parser.add_argument("--finetuned_path", type=str, default=None)
 
     parser.add_argument("--src_video", type=str, default=None)
@@ -474,10 +457,6 @@ def main():
         device_id=args.device_id, rank=0,
         t5_fsdp=False, dit_fsdp=False, use_usp=False, t5_cpu=False,
     )
-
-    if args.lora_path is not None:
-        load_lora_weights(wan_vace.model, args.lora_path, alpha=args.lora_alpha)
-        wan_vace.model.to(wan_vace.device)
 
     if args.finetuned_path is not None:
         load_finetuned_weights(wan_vace.model, args.finetuned_path)

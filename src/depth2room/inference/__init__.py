@@ -5,13 +5,14 @@ import os
 import torch
 
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
-from depth2room.training.training_unit import replace_vace_unit
+from depth2room.training.training_unit import replace_vace_unit, patch_pipeline_for_validity_mask
 
 
-def load_pipeline(model_dir, checkpoint_path=None, lora_alpha=1.0, device="cuda"):
-    """Load the VACE pipeline with optional LoRA checkpoint.
+def load_pipeline(model_dir, checkpoint_path=None, device="cuda"):
+    """Load the VACE pipeline with optional fine-tuned checkpoint.
 
     Shared by eval.py and infer_exr.py.
+    The returned pipeline accepts vace_validity_mask at inference.
     """
     assert os.path.isdir(model_dir), f"Model directory not found: {model_dir}"
     if checkpoint_path is not None:
@@ -32,9 +33,39 @@ def load_pipeline(model_dir, checkpoint_path=None, lora_alpha=1.0, device="cuda"
     pipe = replace_vace_unit(pipe)
     print("Replaced VACE unit with depth-aware version")
 
+    # Expand Context Embedder: 96 -> 160 input channels for validity mask
+    old_conv = pipe.vace.vace_patch_embedding
+    in_ch_old = old_conv.weight.shape[1]
+    if in_ch_old == 96:
+        in_ch_new = 160
+        out_ch = old_conv.weight.shape[0]
+        new_conv = torch.nn.Conv3d(
+            in_ch_new, out_ch,
+            kernel_size=old_conv.kernel_size,
+            stride=old_conv.stride,
+            padding=old_conv.padding,
+            bias=old_conv.bias is not None,
+        )
+        new_conv = new_conv.to(device=old_conv.weight.device, dtype=old_conv.weight.dtype)
+        new_conv.weight.data.zero_()
+        new_conv.weight.data[:, :in_ch_old] = old_conv.weight.data
+        if old_conv.bias is not None:
+            new_conv.bias.data = old_conv.bias.data.clone()
+        pipe.vace.vace_patch_embedding = new_conv
+        print(f"Expanded vace_patch_embedding: {in_ch_old} -> {in_ch_new} input channels")
+
     if checkpoint_path is not None:
-        print(f"Loading LoRA checkpoint: {checkpoint_path}")
-        pipe.load_lora(pipe.vace, checkpoint_path, alpha=lora_alpha)
-        print(f"LoRA loaded (alpha={lora_alpha})")
+        from safetensors.torch import load_file
+        print(f"Loading checkpoint: {checkpoint_path}")
+        state_dict = load_file(checkpoint_path)
+        missing, unexpected = pipe.vace.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"Warning: {len(missing)} missing keys")
+        if unexpected:
+            print(f"Warning: {len(unexpected)} unexpected keys")
+        print("Checkpoint loaded")
+
+    # Patch __call__ to accept and forward vace_validity_mask
+    pipe = patch_pipeline_for_validity_mask(pipe)
 
     return pipe
