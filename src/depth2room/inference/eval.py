@@ -104,12 +104,27 @@ def compute_eval_metrics(gen_frames, gt_video_path, device="cpu"):
     }
 
 
-def select_eval_scenes(data_dir, num_scenes, seed=42):
-    """Select random scenes for evaluation."""
-    metadata_path = os.path.join(data_dir, "metadata.json")
-    captions_path = os.path.join(data_dir, "captions.json")
-    assert os.path.exists(metadata_path), f"metadata.json not found: {metadata_path}"
-    assert os.path.exists(captions_path), f"captions.json not found: {captions_path}"
+def select_eval_scenes(data_dir, num_scenes, seed=42, eval_only=False):
+    """Select scenes for evaluation.
+
+    Args:
+        data_dir: Dataset directory containing metadata/captions JSON files.
+        num_scenes: Max number of scenes to select.
+        seed: Random seed for selection.
+        eval_only: If True, use eval_metadata.json/eval_captions.json (held-out
+            scenes only). Falls back to full metadata if eval files don't exist.
+    """
+    if eval_only:
+        metadata_path = os.path.join(data_dir, "eval_metadata.json")
+        captions_path = os.path.join(data_dir, "eval_captions.json")
+        if not os.path.exists(metadata_path):
+            print(f"eval_metadata.json not found, falling back to full metadata")
+            eval_only = False
+    if not eval_only:
+        metadata_path = os.path.join(data_dir, "metadata.json")
+        captions_path = os.path.join(data_dir, "captions.json")
+    assert os.path.exists(metadata_path), f"metadata not found: {metadata_path}"
+    assert os.path.exists(captions_path), f"captions not found: {captions_path}"
 
     with open(metadata_path) as f:
         metadata = json.load(f)
@@ -268,6 +283,8 @@ def main():
     parser.add_argument("--no_ref", action="store_true")
     parser.add_argument("--no_metrics", action="store_true",
                         help="Skip LPIPS/SSIM computation against ground truth.")
+    parser.add_argument("--eval_only", action="store_true",
+                        help="Use held-out eval scenes only (eval_metadata.json).")
     parser.add_argument("--device", type=str, default="cuda")
     args = parser.parse_args()
 
@@ -278,7 +295,8 @@ def main():
             name = "base_model"
         args.output_dir = os.path.join("eval_output", name)
 
-    scenes = select_eval_scenes(args.data_dir, args.scenes, seed=args.seed)
+    scenes = select_eval_scenes(args.data_dir, args.scenes, seed=args.seed,
+                                eval_only=args.eval_only)
     print(f"Selected {len(scenes)} scenes for evaluation")
 
     pipe = load_pipeline(args.model_dir, args.checkpoint, args.device)

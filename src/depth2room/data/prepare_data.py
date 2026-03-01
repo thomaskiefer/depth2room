@@ -303,8 +303,8 @@ def process_scene(clip_name: str, args: argparse.Namespace) -> dict | None:
         video_path = os.path.join(scene_output_dir, f"{clip_name}_rgb.mp4")
         save_rgb_video(rgb_tensor, video_path, fps=16)
 
-        # Save reference image from a random frame
-        ref_frame_idx = random.randint(0, num_frames - 1)
+        # Save reference image from frame 0 (for autoregressive generation)
+        ref_frame_idx = 0
         ref_path = os.path.join(scene_output_dir, f"{clip_name}_ref.jpg")
         ref_img = rgb_tensor[ref_frame_idx]
         ref_pil = torchvision.transforms.functional.to_pil_image(ref_img)

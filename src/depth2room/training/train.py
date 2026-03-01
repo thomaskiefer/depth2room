@@ -16,12 +16,15 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
+import shutil
 import warnings
 
 import accelerate
 import torch
+from tqdm import tqdm
 
 from diffsynth.pipelines.wan_video import WanVideoPipeline, ModelConfig
 from diffsynth.diffusion import (
@@ -30,12 +33,11 @@ from diffsynth.diffusion import (
     DirectDistillLoss,
     add_general_config,
     add_video_size_config,
-    launch_training_task,
     launch_data_process_task,
 )
 
 from depth2room.training.dataset import VACEDepthDataset
-from depth2room.training.training_unit import replace_vace_unit
+from depth2room.training.training_unit import replace_vace_unit, patch_pipeline_for_validity_mask
 from depth2room.training.logger import ModelLogger
 
 
@@ -80,6 +82,9 @@ class WanDepthTrainingModule(DiffusionTrainingModule):
         # Replace the VACE unit with our depth-aware version BEFORE splitting
         self.pipe = replace_vace_unit(self.pipe)
         print("Replaced WanVideoUnit_VACE with WanVideoUnit_VACE_Depth")
+
+        # Patch pipeline to accept vace_validity_mask kwarg for inference viz
+        self.pipe = patch_pipeline_for_validity_mask(self.pipe)
 
         # Expand Context Embedder: 96 -> 160 input channels for validity mask
         # New 64 channels are zero-initialized so model starts from pretrained behavior
@@ -221,7 +226,99 @@ def depth_train_parser():
     parser.add_argument("--initialize_model_on_cpu", default=False, action="store_true", help="Initialize models on CPU.")
     parser.add_argument("--dry_run", default=False, action="store_true",
                         help="Load one sample, run one forward pass, print shapes/loss, then exit.")
+    parser.add_argument("--resume_from_checkpoint", type=str, default=None,
+                        help="Path to resume-N directory to resume training from.")
     return parser
+
+
+def _save_resume_checkpoint(accelerator, model_logger, epoch_id, step_in_epoch):
+    """Save full training state (optimizer, scheduler, RNG) for resume."""
+    ckpt_dir = os.path.join(model_logger.output_path, f"resume-{model_logger.num_steps}")
+    accelerator.save_state(ckpt_dir)
+    if accelerator.is_main_process:
+        with open(os.path.join(ckpt_dir, "training_state.json"), "w") as f:
+            json.dump({
+                "num_steps": model_logger.num_steps,
+                "epoch": epoch_id,
+                "step_in_epoch": step_in_epoch,
+                "wandb_run_id": model_logger.wandb_run_id,
+            }, f)
+        # Keep only last 2 resume checkpoints to save disk (~5 GB each)
+        _cleanup_old_resume_checkpoints(model_logger.output_path, keep=2)
+        print(f"  Saved resume checkpoint: {ckpt_dir}")
+
+
+def _cleanup_old_resume_checkpoints(output_path, keep=2):
+    """Remove old resume-* directories, keeping the most recent `keep`."""
+    dirs = []
+    for d in os.listdir(output_path):
+        if d.startswith("resume-"):
+            try:
+                dirs.append((int(d.split("-")[1]), d))
+            except ValueError:
+                continue
+    dirs.sort()
+    for _, d in dirs[:-keep]:
+        shutil.rmtree(os.path.join(output_path, d))
+
+
+def launch_training_task(accelerator, dataset, model, model_logger,
+                         args, resume_from_checkpoint=None):
+    """Training loop with checkpoint resume support.
+
+    Based on DiffSynth-Studio's launch_training_task but extended with:
+    - accelerator.save_state() / load_state() for full training state resume
+    - Epoch/step skip logic for resuming mid-epoch
+    - Checkpoint rotation (keeps last 2 resume checkpoints)
+    """
+    optimizer = torch.optim.AdamW(
+        model.trainable_modules(), lr=args.learning_rate, weight_decay=args.weight_decay)
+    scheduler = torch.optim.lr_scheduler.ConstantLR(optimizer)
+    dataloader = torch.utils.data.DataLoader(
+        dataset, shuffle=True, collate_fn=lambda x: x[0], num_workers=args.dataset_num_workers)
+    model.to(device=accelerator.device)
+    model, optimizer, dataloader, scheduler = accelerator.prepare(
+        model, optimizer, dataloader, scheduler)
+
+    starting_epoch = 0
+    resume_step = 0
+
+    if resume_from_checkpoint:
+        accelerator.load_state(resume_from_checkpoint)
+        with open(os.path.join(resume_from_checkpoint, "training_state.json")) as f:
+            state = json.load(f)
+        model_logger.num_steps = state["num_steps"]
+        starting_epoch = state["epoch"]
+        resume_step = state["step_in_epoch"]
+        print(f"Resumed from step {model_logger.num_steps} "
+              f"(epoch {starting_epoch}, step_in_epoch {resume_step})")
+
+    for epoch_id in range(starting_epoch, args.num_epochs):
+        if epoch_id == starting_epoch and resume_step > 0:
+            active_dataloader = accelerator.skip_first_batches(dataloader, resume_step)
+            print(f"Skipping first {resume_step} batches of epoch {epoch_id}")
+        else:
+            active_dataloader = dataloader
+
+        for step, data in enumerate(tqdm(active_dataloader)):
+            with accelerator.accumulate(model):
+                optimizer.zero_grad()
+                loss = model(data)
+                accelerator.backward(loss)
+                optimizer.step()
+                model_logger.on_step_end(accelerator, model, args.save_steps, loss=loss)
+                scheduler.step()
+
+            # Save full training state for resume alongside model checkpoint
+            if args.save_steps and model_logger.num_steps % args.save_steps == 0:
+                actual_step = step + (resume_step if epoch_id == starting_epoch else 0)
+                _save_resume_checkpoint(
+                    accelerator, model_logger, epoch_id, actual_step + 1)
+
+        if args.save_steps is None:
+            model_logger.on_epoch_end(accelerator, model, epoch_id)
+
+    model_logger.on_training_end(accelerator, model, args.save_steps)
 
 
 if __name__ == "__main__":
@@ -244,6 +341,32 @@ if __name__ == "__main__":
     )
     print(f"Dataset loaded: {len(dataset)} samples")
 
+    # Validation dataset: held-out eval clips, no repeat, no reference dropout
+    eval_csv = os.path.join(args.dataset_base_path, "metadata_eval.csv")
+    val_dataset = None
+    if os.path.exists(eval_csv):
+        val_dataset = VACEDepthDataset(
+            base_path=args.dataset_base_path,
+            metadata_path=eval_csv,
+            num_frames=args.num_frames,
+            height=args.height,
+            width=args.width,
+            max_pixels=args.max_pixels,
+            repeat=1,
+            ref_drop_prob=0.0,
+        )
+        print(f"Validation dataset: {len(val_dataset)} held-out eval samples")
+    else:
+        print(f"No eval CSV found at {eval_csv}, validation disabled")
+
+    # Read wandb resume ID if resuming from checkpoint
+    wandb_resume_id = None
+    if args.resume_from_checkpoint:
+        state_file = os.path.join(args.resume_from_checkpoint, "training_state.json")
+        if os.path.exists(state_file):
+            with open(state_file) as f:
+                wandb_resume_id = json.load(f).get("wandb_run_id")
+
     # Use our custom training module with depth-aware VACE unit
     model = WanDepthTrainingModule(
         model_paths=args.model_paths,
@@ -261,12 +384,19 @@ if __name__ == "__main__":
         max_timestep_boundary=args.max_timestep_boundary,
         min_timestep_boundary=args.min_timestep_boundary,
     )
+    # VACE_MODEL_DIR is set in train.sbatch; needed for inference viz at checkpoints
+    vace_model_dir = os.environ.get("VACE_MODEL_DIR")
     model_logger = ModelLogger(
         args.output_path,
         remove_prefix_in_ckpt=args.remove_prefix_in_ckpt,
         wandb_project="vace-depth-finetune",
+        wandb_entity="team-thomas",
         wandb_config=vars(args),
         wandb_run_name=f"full-lr{args.learning_rate}",
+        wandb_resume_id=wandb_resume_id,
+        val_dataset=val_dataset,
+        num_val_samples=15,
+        model_dir=vace_model_dir,
     )
     if args.dry_run:
         print("\n=== DRY RUN: loading one sample and running one forward pass ===")
@@ -298,13 +428,9 @@ if __name__ == "__main__":
         loss = model(data)
         print(f"  loss: {loss.item():.6f} (finite={torch.isfinite(loss).item()})")
         print("=== DRY RUN COMPLETE ===")
+    elif args.task in ("sft:data_process", "direct_distill:data_process"):
+        launch_data_process_task(accelerator, dataset, model, model_logger, args=args)
     else:
-        launcher_map = {
-            "sft:data_process": launch_data_process_task,
-            "direct_distill:data_process": launch_data_process_task,
-            "sft": launch_training_task,
-            "sft:train": launch_training_task,
-            "direct_distill": launch_training_task,
-            "direct_distill:train": launch_training_task,
-        }
-        launcher_map[args.task](accelerator, dataset, model, model_logger, args=args)
+        launch_training_task(
+            accelerator, dataset, model, model_logger,
+            args=args, resume_from_checkpoint=args.resume_from_checkpoint)

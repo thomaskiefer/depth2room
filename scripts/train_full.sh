@@ -37,10 +37,11 @@ accelerate launch \
     --height 480 \
     --width 832 \
     --num_frames 81 \
-    --learning_rate 5e-5 \
-    --num_epochs 2 \
-    --use_gradient_checkpointing_offload \
+    --learning_rate 1e-4 \
+    --num_epochs 5 \
+    --dataset_repeat 10 \
+    --use_gradient_checkpointing \
     --initialize_model_on_cpu \
-    --dataset_num_workers 4 \
-    --save_steps 500 \
+    --dataset_num_workers 8 \
+    --save_steps 200 \
     --gradient_accumulation_steps 1

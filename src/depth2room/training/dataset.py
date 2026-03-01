@@ -15,6 +15,7 @@ The returned dict contains:
 
 import math
 import os
+import random
 
 import torch
 from diffsynth.core.data.unified_dataset import UnifiedDataset
@@ -94,8 +95,13 @@ class VACEDepthDataset(torch.utils.data.Dataset):
         width=832,
         max_pixels=1920 * 1080,
         repeat=1,
+        ref_drop_prob=0.5,
     ):
         self.base_path = base_path
+        self.num_frames = num_frames
+        self.height = height
+        self.width = width
+        self.ref_drop_prob = ref_drop_prob
         self.depth_loader = LoadDepthTensor(base_path=base_path)
         self.validity_loader = LoadValidityMask(base_path=base_path)
 
@@ -230,6 +236,9 @@ class VACEDepthDataset(torch.utils.data.Dataset):
 
         # Handle empty vace_reference_image (CSV has empty string for no-ref rows)
         if "vace_reference_image" not in data or data.get("vace_reference_image") in ("", None):
+            data["vace_reference_image"] = None
+        # Dynamic reference image dropout (re-randomized per sample per epoch)
+        elif self.ref_drop_prob > 0 and random.random() < self.ref_drop_prob:
             data["vace_reference_image"] = None
 
         # Remove the raw vace_video string path if still present

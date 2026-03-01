@@ -37,8 +37,12 @@ def main():
         help="Output CSV path. Defaults to <data_dir>/metadata.csv.",
     )
     parser.add_argument(
-        "--no_ref_fraction", type=float, default=0.15,
-        help="Fraction of samples that omit the reference image (default: 0.15).",
+        "--no_ref_fraction", type=float, default=0.0,
+        help="Fraction of samples that omit the reference image in CSV (default: 0.0, dropout is dynamic in dataloader).",
+    )
+    parser.add_argument(
+        "--exclude_video_ids", type=str, default="",
+        help="Comma-separated video_ids to exclude (e.g. for eval holdout).",
     )
     parser.add_argument("--seed", type=int, default=42)
     args = parser.parse_args()
@@ -60,12 +64,22 @@ def main():
         metadata_list = json.load(f)
     print(f"Loaded {len(metadata_list)} scene entries from {args.metadata_json}")
 
+    exclude_ids = set()
+    if args.exclude_video_ids:
+        exclude_ids = set(v.strip() for v in args.exclude_video_ids.split(",") if v.strip())
+        print(f"Excluding {len(exclude_ids)} video_ids: {exclude_ids}")
+
     rows = []
     missing_caption = 0
     missing_files = 0
+    excluded = 0
 
     for entry in metadata_list:
         clip_name = entry["clip_name"]
+        video_id = entry.get("video_id", clip_name.rsplit("_", 1)[0])
+        if video_id in exclude_ids:
+            excluded += 1
+            continue
         depth_path = entry["depth_path"]
         rgb_path = entry["rgb_path"]
         ref_path = entry.get("ref_path")
@@ -101,6 +115,8 @@ def main():
             "prompt": prompt,
         })
 
+    if excluded > 0:
+        print(f"Excluded {excluded} scenes from {len(exclude_ids)} video_ids")
     if missing_caption > 0:
         print(f"Warning: {missing_caption} scenes had no caption in captions.json")
     if missing_files > 0:
