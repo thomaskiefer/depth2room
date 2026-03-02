@@ -305,6 +305,7 @@ def launch_training_task(accelerator, dataset, model, model_logger,
                 optimizer.zero_grad()
                 loss = model(data)
                 accelerator.backward(loss)
+                accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optimizer.step()
                 model_logger.on_step_end(accelerator, model, args.save_steps, loss=loss)
                 scheduler.step()
@@ -392,7 +393,7 @@ if __name__ == "__main__":
         wandb_project="vace-depth-finetune",
         wandb_entity="team-thomas",
         wandb_config=vars(args),
-        wandb_run_name=f"full-lr{args.learning_rate}",
+        wandb_run_name=f"1.3B-32gpu-lr{args.learning_rate:.1e}",
         wandb_resume_id=wandb_resume_id,
         val_dataset=val_dataset,
         num_val_samples=15,

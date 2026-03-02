@@ -13,11 +13,15 @@ The returned dict contains:
   - "vace_reference_image": list[PIL.Image] or None
 """
 
+import logging
 import math
 import os
 import random
+import time
 
 import torch
+
+log = logging.getLogger(__name__)
 from diffsynth.core.data.unified_dataset import UnifiedDataset
 from depth2room.utils import validate_depth_tensor
 from diffsynth.core.data.operators import (
@@ -197,6 +201,24 @@ class VACEDepthDataset(torch.utils.data.Dataset):
         return len(self.unified_dataset)
 
     def __getitem__(self, idx):
+        # Retry with backoff on transient Lustre I/O errors, then fall back to
+        # a random different sample.  Covers all file reads: video (imageio/ffmpeg),
+        # reference image (PIL), depth tensor (.pt), and validity mask (.pt).
+        last_err = None
+        for attempt in range(3):
+            try:
+                return self._load_sample(idx)
+            except (OSError, IOError, RuntimeError) as e:
+                last_err = e
+                log.warning("Sample %d failed (attempt %d/3): %s", idx, attempt + 1, e)
+                time.sleep(1.0 * (attempt + 1))
+                # Try a different sample on next attempt
+                idx = random.randint(0, len(self) - 1)
+        raise RuntimeError(
+            f"Failed to load any sample after 3 attempts. Last error: {last_err}"
+        )
+
+    def _load_sample(self, idx):
         # Get the standard data from UnifiedDataset
         data = self.unified_dataset[idx]
 

@@ -2,7 +2,7 @@
 #SBATCH --job-name=depth2room
 #SBATCH --partition=normal
 #SBATCH --time=12:00:00
-#SBATCH --nodes=8
+#SBATCH --nodes=4
 #SBATCH --ntasks-per-node=4
 #SBATCH --gpus-per-node=4
 #SBATCH --account=a115
