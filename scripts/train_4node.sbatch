@@ -56,7 +56,7 @@ python3 -m depth2room.training.train \
     --use_gradient_checkpointing \
     --initialize_model_on_cpu \
     --dataset_num_workers 8 \
-    --save_steps 150 \
+    --save_steps 300 \
     --gradient_accumulation_steps 1 \
     # To resume from a checkpoint, replace the line above with:
     # --gradient_accumulation_steps 1 \
